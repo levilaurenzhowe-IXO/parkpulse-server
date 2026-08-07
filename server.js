@@ -277,6 +277,101 @@ app.get('/api/rides-list', async (req, res) => {
   }
 });
 
+// ---------- TAGES-STATISTIKEN (für den neuen Statistik-Tab im Frontend) ----------
+// Liefert in einer Antwort alles, was der Statistik-Tab braucht:
+//  - dailySummary: pro vergangenem Tag -> Ø Wartezeit, max. gleichzeitige "Besucherlast"
+//  - perRideDaily: pro Tag UND pro Attraktion -> Ø Wartezeit (für die Tabelle)
+//  - averageDay: alle Tage nach Uhrzeit gemittelt -> "so sieht ein durchschnittlicher Tag aus"
+// capacity-Werte für die Besucher-Schätzung kommen vom Frontend (RIDE_DATABASE),
+// deswegen liefert der Server hier bewusst nur die reinen Wartezeit-Rohdaten;
+// die Umrechnung in "Personen in der Schlange" macht das Frontend wie gewohnt.
+app.get('/api/daily-stats', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const days = Math.min(parseInt(req.query.days, 10) || 30, 90); // max. 90 Tage abfragen
+
+  try {
+    // Älteste noch relevante Datumsgrenze berechnen (heute - X Tage)
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    // 1) Pro Tag: Durchschnittliche Wartezeit über alle offenen Attraktionen
+    const dailySummaryResult = await db.execute({
+      sql: `
+        SELECT
+          recorded_date,
+          AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
+          COUNT(DISTINCT recorded_at) as sample_points,
+          MAX(CASE WHEN is_open = 1 THEN wait_time ELSE 0 END) as peak_wait
+        FROM wait_times
+        WHERE park_id = ? AND recorded_date >= ?
+        GROUP BY recorded_date
+        ORDER BY recorded_date ASC
+      `,
+      args: [parkId, cutoffDate]
+    });
+
+    // 2) Pro Tag UND pro Attraktion: Durchschnittliche Wartezeit (für die Tabelle)
+    const perRideDailyResult = await db.execute({
+      sql: `
+        SELECT
+          recorded_date,
+          ride_name,
+          AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
+          MAX(CASE WHEN is_open = 1 THEN wait_time ELSE 0 END) as peak_wait
+        FROM wait_times
+        WHERE park_id = ? AND recorded_date >= ?
+        GROUP BY recorded_date, ride_name
+        ORDER BY recorded_date ASC, ride_name ASC
+      `,
+      args: [parkId, cutoffDate]
+    });
+
+    // 3) "Durchschnittstag": alle Tage nach Uhrzeit (HH:MM) gemittelt, über alle
+    // offenen Attraktionen -> zeigt den typischen Tagesverlauf unabhängig vom Datum
+    const averageDayResult = await db.execute({
+      sql: `
+        SELECT
+          recorded_time,
+          AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
+          COUNT(DISTINCT recorded_date) as days_counted
+        FROM wait_times
+        WHERE park_id = ? AND recorded_date >= ?
+        GROUP BY recorded_time
+        ORDER BY recorded_time ASC
+      `,
+      args: [parkId, cutoffDate]
+    });
+
+    // 4) Durchschnittstag PRO Attraktion (für den Fall, dass wir das später pro
+    // Attraktion einzeln anzeigen wollen -> schon mitgeliefert, kostet kaum mehr)
+    const averageDayPerRideResult = await db.execute({
+      sql: `
+        SELECT
+          recorded_time,
+          ride_name,
+          AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait
+        FROM wait_times
+        WHERE park_id = ? AND recorded_date >= ?
+        GROUP BY recorded_time, ride_name
+        ORDER BY recorded_time ASC, ride_name ASC
+      `,
+      args: [parkId, cutoffDate]
+    });
+
+    res.json({
+      dailySummary: dailySummaryResult.rows,
+      perRideDaily: perRideDailyResult.rows,
+      averageDay: averageDayResult.rows,
+      averageDayPerRide: averageDayPerRideResult.rows
+    });
+
+  } catch (err) {
+    console.error('Fehler in /api/daily-stats:', err.message);
+    res.status(500).json({ error: 'Serverfehler bei Tages-Statistik-Abfrage.' });
+  }
+});
+
 // ---------- SERVER START ----------
 async function start() {
   try {
