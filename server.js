@@ -129,6 +129,18 @@ cron.schedule('*/15 * * * *', () => {
 
 // --- API ENDPUNKTE ---
 
+// Health-Check: Wird von einem externen kostenlosen Dienst (z.B. cron-job.org)
+// alle paar Minuten aufgerufen, damit Render den Server nie in den Ruhemodus
+// schickt. So läuft der interne 15-Minuten-Cronjob (oben) durchgehend weiter,
+// auch wenn gerade niemand die App öffnet.
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    lastDataFetch: lastFetchTimestamp ? new Date(lastFetchTimestamp).toISOString() : null
+  });
+});
+
 // Aktuelle Live-Daten + heutiger Verlauf (ab Parköffnung, also ab dem ersten
 // Messpunkt von heute) für einen Park
 app.get('/api/park', async (req, res) => {
@@ -161,9 +173,6 @@ app.get('/api/park', async (req, res) => {
     const grouped = {};
     for (const row of result.rows) {
       if (hiddenNames.has(row.ride_name)) continue; // ausgeblendete Fahrgeschäfte überspringen
-
-      const key = row.recorded_time + '_' + row.recorded_at; // eindeutig je Messung
-      const bucketKey = Math.floor(row.recorded_at / (60 * 1000)); // grobe Minuten-Bucket-Gruppierung
 
       if (!grouped[row.recorded_at]) {
         grouped[row.recorded_at] = {
