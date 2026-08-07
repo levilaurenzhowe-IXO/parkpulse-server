@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 const fetch = require('node-fetch');
+const { createClient } = require('@libsql/client');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,63 +10,106 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Verlaufsspeicher für alle Parks
-const historyData = {
-  '60': [], // Kings Island
-  '64': [], // Cedar Point
-  '56': []  // Phantasialand
-};
+// ---------- TURSO DATENBANK VERBINDUNG ----------
+// WICHTIG: URL und Token kommen aus Umgebungsvariablen (Render Dashboard),
+// niemals hier fest eintragen -> sonst landen sie auf GitHub!
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
+
+const PARKS = [
+  { id: '60', name: 'Kings Island' },
+  { id: '64', name: 'Cedar Point' },
+  { id: '56', name: 'Phantasialand' }
+];
 
 let lastFetchTimestamp = 0;
 
+// ---------- DATENBANK-SCHEMA ANLEGEN (einmalig beim Start) ----------
+async function initDatabase() {
+  // Eine Zeile pro Messpunkt pro Attraktion. Das erlaubt uns später beliebige
+  // Auswertungen nach Datum, Wochentag, Uhrzeit, pro Attraktion etc.
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS wait_times (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      park_id TEXT NOT NULL,
+      ride_id TEXT,
+      ride_name TEXT NOT NULL,
+      is_open INTEGER NOT NULL,
+      wait_time INTEGER NOT NULL,
+      recorded_at INTEGER NOT NULL,
+      recorded_date TEXT NOT NULL,
+      recorded_time TEXT NOT NULL,
+      weekday INTEGER NOT NULL
+    )
+  `);
+
+  // Indexe für schnelle Abfragen (nach Park+Datum, und nach Attraktion)
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_park_date ON wait_times (park_id, recorded_date)`);
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_ride_name ON wait_times (park_id, ride_name)`);
+
+  // Tabelle für ausgeblendete Attraktionen (pro Park)
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS hidden_rides (
+      park_id TEXT NOT NULL,
+      ride_name TEXT NOT NULL,
+      PRIMARY KEY (park_id, ride_name)
+    )
+  `);
+
+  console.log('✅ Datenbank-Schema bereit.');
+}
+
+// ---------- DATEN ABRUFEN UND SPEICHERN ----------
 async function fetchAndSaveData() {
   console.log(`[${new Date().toISOString()}] Starte Datenabruf für alle Parks...`);
 
-  const parksToFetch = [
-    { id: '60', name: 'Kings Island' },
-    { id: '64', name: 'Cedar Point' },
-    { id: '56', name: 'Phantasialand' }
-  ];
-
-  for (const park of parksToFetch) {
+  for (const park of PARKS) {
     try {
       const res = await fetch(`https://queue-times.com/parks/${park.id}/queue_times.json`);
-      
-      if (res.ok) {
-        const data = await res.json();
-        let rides = [];
 
-        if (data.rides) rides.push(...data.rides);
-        if (data.lands) {
-          data.lands.forEach(land => {
-            if (land.rides) rides.push(...land.rides);
-          });
-        }
+      if (!res.ok) continue;
 
-        const formattedRides = rides.map(r => ({
-          id: r.id,
-          name: r.name,
-          isOpen: r.is_open,
-          waitTime: r.wait_time || 0
-        }));
-
-        const timestamp = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-
-        if (!historyData[park.id]) historyData[park.id] = [];
-
-        historyData[park.id].push({
-          time: timestamp,
-          timestamp: Date.now(),
-          rides: formattedRides
+      const data = await res.json();
+      let rides = [];
+      if (data.rides) rides.push(...data.rides);
+      if (data.lands) {
+        data.lands.forEach(land => {
+          if (land.rides) rides.push(...land.rides);
         });
-
-        // Maximal 96 Messpunkte behalten (24 Stunden)
-        if (historyData[park.id].length > 96) {
-          historyData[park.id].shift();
-        }
-
-        console.log(`-> ${park.name} (${park.id}): ${formattedRides.length} Attraktionen gespeichert.`);
       }
+
+      const now = new Date();
+      // Deutsche Zeitzone für Datum/Uhrzeit/Wochentag (wichtig für Park in Deutschland)
+      const recordedDate = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' }); // YYYY-MM-DD
+      const recordedTime = now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' });
+      const weekday = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).getDay(); // 0=So, 1=Mo, ...
+
+      // Alle Attraktionen dieses Parks in einem Batch einfügen (effizienter als einzeln)
+      const statements = rides.map(r => ({
+        sql: `INSERT INTO wait_times
+              (park_id, ride_id, ride_name, is_open, wait_time, recorded_at, recorded_date, recorded_time, weekday)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          park.id,
+          String(r.id || ''),
+          r.name,
+          r.is_open ? 1 : 0,
+          r.wait_time || 0,
+          Date.now(),
+          recordedDate,
+          recordedTime,
+          weekday
+        ]
+      }));
+
+      if (statements.length > 0) {
+        await db.batch(statements, 'write');
+      }
+
+      console.log(`-> ${park.name} (${park.id}): ${rides.length} Attraktionen gespeichert.`);
+
     } catch (err) {
       console.error(`Fehler beim Abruf für ${park.name}:`, err.message);
     }
@@ -74,33 +118,165 @@ async function fetchAndSaveData() {
   lastFetchTimestamp = Date.now();
 }
 
-// Timer: Alle 15 Minuten im Hintergrund ausführen
+// Alle 15 Minuten automatisch neue Daten holen
 cron.schedule('*/15 * * * *', () => {
   fetchAndSaveData();
 });
 
-// Beim Start sofort abfragen
-fetchAndSaveData();
-
 // --- API ENDPUNKTE ---
 
-// Verlaufs- und Live-Daten abrufen
+// Aktuelle Live-Daten + heutiger Verlauf (ab Parköffnung, also ab dem ersten
+// Messpunkt von heute) für einen Park
 app.get('/api/park', async (req, res) => {
   const parkId = req.query.park || '56';
 
-  // Wenn der Server geschlafen hat (> 10 Min), sofort frische Daten holen
-  if (Date.now() - lastFetchTimestamp > 10 * 60 * 1000) {
-    console.log("Server war inaktiv, hole frische Daten...");
-    await fetchAndSaveData();
+  try {
+    if (Date.now() - lastFetchTimestamp > 10 * 60 * 1000) {
+      console.log('Server war inaktiv, hole frische Daten...');
+      await fetchAndSaveData();
+    }
+
+    const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    // Alle heutigen Messpunkte holen, chronologisch sortiert
+    const result = await db.execute({
+      sql: `SELECT * FROM wait_times WHERE park_id = ? AND recorded_date = ? ORDER BY recorded_at ASC`,
+      args: [parkId, today]
+    });
+
+    // Ausgeblendete Attraktionen holen
+    const hiddenResult = await db.execute({
+      sql: `SELECT ride_name FROM hidden_rides WHERE park_id = ?`,
+      args: [parkId]
+    });
+    const hiddenNames = new Set(hiddenResult.rows.map(r => r.ride_name));
+
+    // Rohdaten (eine Zeile pro Attraktion+Messpunkt) zurück in das alte
+    // "history"-Format gruppieren, das das Frontend erwartet:
+    // [{ time, timestamp, rides: [{name, isOpen, waitTime}, ...] }, ...]
+    const grouped = {};
+    for (const row of result.rows) {
+      if (hiddenNames.has(row.ride_name)) continue; // ausgeblendete Fahrgeschäfte überspringen
+
+      const key = row.recorded_time + '_' + row.recorded_at; // eindeutig je Messung
+      const bucketKey = Math.floor(row.recorded_at / (60 * 1000)); // grobe Minuten-Bucket-Gruppierung
+
+      if (!grouped[row.recorded_at]) {
+        grouped[row.recorded_at] = {
+          time: row.recorded_time,
+          timestamp: row.recorded_at,
+          rides: []
+        };
+      }
+      grouped[row.recorded_at].rides.push({
+        name: row.ride_name,
+        isOpen: !!row.is_open,
+        waitTime: row.wait_time
+      });
+    }
+
+    const history = Object.values(grouped).sort((a, b) => a.timestamp - b.timestamp);
+
+    res.json({ history, hiddenRides: Array.from(hiddenNames) });
+
+  } catch (err) {
+    console.error('Fehler in /api/park:', err.message);
+    res.status(500).json({ error: 'Serverfehler beim Abrufen der Daten.' });
+  }
+});
+
+// Attraktion ausblenden / wieder einblenden
+app.post('/api/hidden-rides', async (req, res) => {
+  const { parkId, rideName, hidden } = req.body;
+
+  if (!parkId || !rideName) {
+    return res.status(400).json({ error: 'parkId und rideName erforderlich.' });
   }
 
-  const parkHistory = historyData[parkId] || [];
-
-  res.json({
-    history: parkHistory
-  });
+  try {
+    if (hidden) {
+      await db.execute({
+        sql: `INSERT OR IGNORE INTO hidden_rides (park_id, ride_name) VALUES (?, ?)`,
+        args: [parkId, rideName]
+      });
+    } else {
+      await db.execute({
+        sql: `DELETE FROM hidden_rides WHERE park_id = ? AND ride_name = ?`,
+        args: [parkId, rideName]
+      });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Fehler in /api/hidden-rides:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`ParkPulse Server läuft auf Port ${PORT}`);
+// Wochentags-/Uhrzeit-Statistik pro Attraktion: durchschnittliche Wartezeit
+// gruppiert nach Wochentag und Stunde -> Basis für Empfehlungen
+app.get('/api/stats', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const rideName = req.query.ride; // optional: nur eine bestimmte Attraktion
+
+  try {
+    let sql = `
+      SELECT
+        ride_name,
+        weekday,
+        CAST(substr(recorded_time, 1, 2) AS INTEGER) as hour,
+        AVG(wait_time) as avg_wait,
+        COUNT(*) as sample_count
+      FROM wait_times
+      WHERE park_id = ? AND is_open = 1
+    `;
+    const args = [parkId];
+
+    if (rideName) {
+      sql += ` AND ride_name = ?`;
+      args.push(rideName);
+    }
+
+    sql += ` GROUP BY ride_name, weekday, hour ORDER BY ride_name, weekday, hour`;
+
+    const result = await db.execute({ sql, args });
+
+    res.json({ stats: result.rows });
+
+  } catch (err) {
+    console.error('Fehler in /api/stats:', err.message);
+    res.status(500).json({ error: 'Serverfehler bei Statistik-Abfrage.' });
+  }
 });
+
+// Liste aller bekannten Attraktionsnamen eines Parks (für Ausblenden-UI)
+app.get('/api/rides-list', async (req, res) => {
+  const parkId = req.query.park || '56';
+
+  try {
+    const result = await db.execute({
+      sql: `SELECT DISTINCT ride_name FROM wait_times WHERE park_id = ? ORDER BY ride_name ASC`,
+      args: [parkId]
+    });
+    res.json({ rides: result.rows.map(r => r.ride_name) });
+  } catch (err) {
+    console.error('Fehler in /api/rides-list:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- SERVER START ----------
+async function start() {
+  try {
+    await initDatabase();
+    await fetchAndSaveData(); // sofort beim Start erste Daten holen
+
+    app.listen(PORT, () => {
+      console.log(`ParkPulse Server läuft auf Port ${PORT}`);
+    });
+  } catch (err) {
+    console.error('❌ Fehler beim Start:', err.message);
+    process.exit(1);
+  }
+}
+
+start();
