@@ -50,6 +50,10 @@ async function initDatabase() {
   await db.execute(`CREATE INDEX IF NOT EXISTS idx_ride_name ON wait_times (park_id, ride_name)`);
 
   // Tabelle für ausgeblendete Attraktionen (pro Park)
+  // HINWEIS: Wird aktuell NICHT vom Frontend genutzt - Ausblenden läuft bewusst
+  // rein lokal über localStorage im Browser (siehe index.html), damit jedes
+  // Familienmitglied eigene Einstellungen hat. Tabelle bleibt für mögliche
+  // spätere Server-Funktionen (z.B. "häufig ausgeblendet") bestehen.
   await db.execute(`
     CREATE TABLE IF NOT EXISTS hidden_rides (
       park_id TEXT NOT NULL,
