@@ -10,12 +10,11 @@ app.use(cors());
 app.use(express.json());
 
 const historyData = {};
+let lastFetchTimestamp = 0; // Merkt sich, wann zuletzt Daten geholt wurden
 
 async function fetchAndSaveData() {
-  console.log(`[${new Date().toISOString()}] Starte 15-Minuten Abruf...`);
+  console.log(`[${new Date().toISOString()}] Starte Datenabruf...`);
 
-  // Alle Parks nutzen jetzt die zuverlässige Queue-Times API mit ihren IDs!
-  // 60 = Kings Island, 64 = Cedar Point, 56 = Phantasialand
   const parksToFetch = [
     { id: '60', name: 'Kings Island' },
     { id: '64', name: 'Cedar Point' },
@@ -30,7 +29,6 @@ async function fetchAndSaveData() {
       if (res.ok) {
         const data = await res.json();
         
-        // Attraktionen aus Hauptliste und Unterbereichen (Lands) zusammenführen
         if (data.rides) rides.push(...data.rides);
         if (data.lands) {
           data.lands.forEach(land => {
@@ -53,30 +51,41 @@ async function fetchAndSaveData() {
         rides: rides
       });
 
-      // Maximal 96 Messpunkte aufbewahren (24 Stunden)
       if (historyData[park.id].length > 96) {
         historyData[park.id].shift();
       }
 
-      console.log(`-> ${park.name}: ${rides.length} Attraktionen gefunden.`);
+      console.log(`-> ${park.name}: ${rides.length} Attraktionen gespeichert.`);
 
     } catch (err) {
       console.error(`Fehler bei ${park.name}:`, err.message);
     }
   }
+
+  // Speicher-Zeitpunkt aktualisieren
+  lastFetchTimestamp = Date.now();
 }
 
-// Alle 15 Minuten ausführen
+// Timer für dauerhafte Hintergrund-Messungen (wenn Server wach ist)
 cron.schedule('*/15 * * * *', () => {
   fetchAndSaveData();
 });
 
-// Beim Start sofort ausführen
+// Beim Serverstart sofort ausführen
 fetchAndSaveData();
 
-// API Endpunkte
-app.get('/api/live', (req, res) => {
+// --- API Endpunkte ---
+
+app.get('/api/live', async (req, res) => {
   const parkId = req.query.park || '60';
+
+  // PRÜFUNG: Sind die Daten älter als 10 Minuten? (z.B. weil der Server geschlafen hat)
+  const tenMinutesInMs = 10 * 60 * 1000;
+  if (Date.now() - lastFetchTimestamp > tenMinutesInMs) {
+    console.log("Daten veraltet (Server war inaktiv). Hole jetzt sofort neue Live-Daten...");
+    await fetchAndSaveData(); // Sofort neue Daten holen!
+  }
+
   const parkHistory = historyData[parkId] || [];
   const latestEntry = parkHistory[parkHistory.length - 1];
 
