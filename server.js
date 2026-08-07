@@ -9,58 +9,72 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Speicher für Verlaufsdaten (hält Daten der letzten 24h)
-const historyData = [];
+// Verlaufsspeicher für alle Parks
+const historyData = {
+  '60': [], // Kings Island
+  '64': [], // Cedar Point
+  '56': []  // Phantasialand
+};
+
 let lastFetchTimestamp = 0;
 
 async function fetchAndSaveData() {
-  console.log(`[${new Date().toISOString()}] Abruf Phantasialand (ID 56)...`);
+  console.log(`[${new Date().toISOString()}] Starte Datenabruf für alle Parks...`);
 
-  try {
-    const res = await fetch(`https://queue-times.com/parks/56/queue_times.json`);
-    
-    if (res.ok) {
-      const data = await res.json();
-      let rides = [];
+  const parksToFetch = [
+    { id: '60', name: 'Kings Island' },
+    { id: '64', name: 'Cedar Point' },
+    { id: '56', name: 'Phantasialand' }
+  ];
 
-      if (data.rides) rides.push(...data.rides);
-      if (data.lands) {
-        data.lands.forEach(land => {
-          if (land.rides) rides.push(...land.rides);
+  for (const park of parksToFetch) {
+    try {
+      const res = await fetch(`https://queue-times.com/parks/${park.id}/queue_times.json`);
+      
+      if (res.ok) {
+        const data = await res.json();
+        let rides = [];
+
+        if (data.rides) rides.push(...data.rides);
+        if (data.lands) {
+          data.lands.forEach(land => {
+            if (land.rides) rides.push(...land.rides);
+          });
+        }
+
+        const formattedRides = rides.map(r => ({
+          id: r.id,
+          name: r.name,
+          isOpen: r.is_open,
+          waitTime: r.wait_time || 0
+        }));
+
+        const timestamp = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+
+        if (!historyData[park.id]) historyData[park.id] = [];
+
+        historyData[park.id].push({
+          time: timestamp,
+          timestamp: Date.now(),
+          rides: formattedRides
         });
+
+        // Maximal 96 Messpunkte behalten (24 Stunden)
+        if (historyData[park.id].length > 96) {
+          historyData[park.id].shift();
+        }
+
+        console.log(`-> ${park.name} (${park.id}): ${formattedRides.length} Attraktionen gespeichert.`);
       }
-
-      const formattedRides = rides.map(r => ({
-        id: r.id,
-        name: r.name,
-        isOpen: r.is_open,
-        waitTime: r.wait_time || 0
-      }));
-
-      const timestamp = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-
-      // In der Historie speichern
-      historyData.push({
-        time: timestamp,
-        timestamp: Date.now(),
-        rides: formattedRides
-      });
-
-      // Maximal 96 Messpunkte behalten (96 * 15 Min = 24 Stunden)
-      if (historyData.length > 96) {
-        historyData.shift();
-      }
-
-      console.log(`-> Phantasialand: ${formattedRides.length} Attraktionen gespeichert.`);
+    } catch (err) {
+      console.error(`Fehler beim Abruf für ${park.name}:`, err.message);
     }
-  } catch (err) {
-    console.error(`Fehler beim Abruf:`, err.message);
   }
 
   lastFetchTimestamp = Date.now();
 }
 
-// Alle 15 Minuten automatisch abfragen
+// Timer: Alle 15 Minuten im Hintergrund ausführen
 cron.schedule('*/15 * * * *', () => {
   fetchAndSaveData();
 });
@@ -70,18 +84,23 @@ fetchAndSaveData();
 
 // --- API ENDPUNKTE ---
 
-// 1. Alle Verlaufsdaten des Tages abrufen
-app.get('/api/phantasialand', async (req, res) => {
+// Verlaufs- und Live-Daten abrufen
+app.get('/api/park', async (req, res) => {
+  const parkId = req.query.park || '56';
+
   // Wenn der Server geschlafen hat (> 10 Min), sofort frische Daten holen
   if (Date.now() - lastFetchTimestamp > 10 * 60 * 1000) {
+    console.log("Server war inaktiv, hole frische Daten...");
     await fetchAndSaveData();
   }
 
+  const parkHistory = historyData[parkId] || [];
+
   res.json({
-    history: historyData
+    history: parkHistory
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`Phantasialand Pulse Server läuft auf Port ${PORT}`);
+  console.log(`ParkPulse Server läuft auf Port ${PORT}`);
 });
