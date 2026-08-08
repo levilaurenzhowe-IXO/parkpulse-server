@@ -277,14 +277,10 @@ app.get('/api/rides-list', async (req, res) => {
   }
 });
 
-// ---------- TAGES-STATISTIKEN (für den neuen Statistik-Tab im Frontend) ----------
-// Liefert in einer Antwort alles, was der Statistik-Tab braucht:
+// ---------- TAGES-STATISTIKEN (Legacy, evtl. später wiederverwendbar) ----------
 //  - dailySummary: pro vergangenem Tag -> Ø Wartezeit, max. gleichzeitige "Besucherlast"
 //  - perRideDaily: pro Tag UND pro Attraktion -> Ø Wartezeit (für die Tabelle)
 //  - averageDay: alle Tage nach Uhrzeit gemittelt -> "so sieht ein durchschnittlicher Tag aus"
-// capacity-Werte für die Besucher-Schätzung kommen vom Frontend (RIDE_DATABASE),
-// deswegen liefert der Server hier bewusst nur die reinen Wartezeit-Rohdaten;
-// die Umrechnung in "Personen in der Schlange" macht das Frontend wie gewohnt.
 app.get('/api/daily-stats', async (req, res) => {
   const parkId = req.query.park || '56';
   const days = Math.min(parseInt(req.query.days, 10) || 30, 90); // max. 90 Tage abfragen
@@ -369,6 +365,110 @@ app.get('/api/daily-stats', async (req, res) => {
   } catch (err) {
     console.error('Fehler in /api/daily-stats:', err.message);
     res.status(500).json({ error: 'Serverfehler bei Tages-Statistik-Abfrage.' });
+  }
+});
+
+// ---------- NEU: ATTRAKTIONS-BASIERTE STATISTIK ----------
+// (für den neu gestalteten Statistik-Tab: Attraktion wählen -> Kalender -> Tagesverlauf,
+// plus gemittelter Verlauf über einen Zeitraum mit Uhrzeit-Empfehlung)
+
+// Liefert alle Tage, an denen für eine bestimmte Attraktion Daten existieren
+// (für den Kalender im Frontend, damit nur wirklich vorhandene Tage anklickbar sind)
+app.get('/api/ride-days', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const rideName = req.query.ride;
+
+  if (!rideName) {
+    return res.status(400).json({ error: 'ride Parameter erforderlich.' });
+  }
+
+  try {
+    const result = await db.execute({
+      sql: `SELECT DISTINCT recorded_date FROM wait_times WHERE park_id = ? AND ride_name = ? ORDER BY recorded_date ASC`,
+      args: [parkId, rideName]
+    });
+    res.json({ days: result.rows.map(r => r.recorded_date) });
+  } catch (err) {
+    console.error('Fehler in /api/ride-days:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// Liefert den Wartezeit-Verlauf für eine Attraktion.
+// Modus 1 (date-Parameter gesetzt): Verlauf genau dieses einen Tages.
+// Modus 2 (kein date, aber days-Parameter): Über den Zeitraum gemittelter
+// Verlauf nach Uhrzeit, PLUS eine automatische Empfehlung für die beste
+// Besuchszeit (Uhrzeit mit der niedrigsten Ø Wartezeit, min. 3 Datenpunkte).
+app.get('/api/ride-history', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const rideName = req.query.ride;
+  const date = req.query.date; // z.B. "2026-08-07" - optional
+  const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
+
+  if (!rideName) {
+    return res.status(400).json({ error: 'ride Parameter erforderlich.' });
+  }
+
+  try {
+    if (date) {
+      // Modus 1: Einzelner Tag, chronologischer Verlauf
+      const result = await db.execute({
+        sql: `
+          SELECT recorded_time, is_open, wait_time
+          FROM wait_times
+          WHERE park_id = ? AND ride_name = ? AND recorded_date = ?
+          ORDER BY recorded_at ASC
+        `,
+        args: [parkId, rideName, date]
+      });
+
+      res.json({
+        mode: 'single-day',
+        date,
+        points: result.rows
+      });
+
+    } else {
+      // Modus 2: Über Zeitraum gemittelt, nach Uhrzeit gruppiert
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - days);
+      const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+      const result = await db.execute({
+        sql: `
+          SELECT
+            recorded_time,
+            AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
+            COUNT(CASE WHEN is_open = 1 THEN 1 ELSE NULL END) as sample_count
+          FROM wait_times
+          WHERE park_id = ? AND ride_name = ? AND recorded_date >= ?
+          GROUP BY recorded_time
+          ORDER BY recorded_time ASC
+        `,
+        args: [parkId, rideName, cutoffDate]
+      });
+
+      // Beste Uhrzeit ermitteln: niedrigste Ø Wartezeit, aber nur Zeitpunkte
+      // mit mindestens 3 Messungen berücksichtigen (sonst zu unzuverlässig)
+      let bestSlot = null;
+      result.rows.forEach(row => {
+        if (row.avg_wait === null || row.sample_count < 3) return;
+        if (!bestSlot || row.avg_wait < bestSlot.avg_wait) {
+          bestSlot = { time: row.recorded_time, avgWait: row.avg_wait, sampleCount: row.sample_count };
+        }
+      });
+
+      res.json({
+        mode: 'averaged',
+        days,
+        points: result.rows,
+        recommendation: bestSlot
+      });
+    }
+
+  } catch (err) {
+    console.error('Fehler in /api/ride-history:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
   }
 });
 
