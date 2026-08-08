@@ -472,6 +472,40 @@ app.get('/api/ride-history', async (req, res) => {
   }
 });
 
+// Durchschnittliche Wartezeit gruppiert nach Wochentag (über alle Attraktionen
+// und alle Tage im gewählten Zeitraum) -> Basis für den Wochentags-Vergleichsgraf
+// im Statistik-Tab. Zeigt z.B. "Dienstags ist im Schnitt am leersten".
+app.get('/api/weekday-stats', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const days = Math.min(parseInt(req.query.days, 10) || 90, 180);
+
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    const result = await db.execute({
+      sql: `
+        SELECT
+          weekday,
+          AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
+          COUNT(DISTINCT recorded_date) as days_counted
+        FROM wait_times
+        WHERE park_id = ? AND recorded_date >= ?
+        GROUP BY weekday
+        ORDER BY weekday ASC
+      `,
+      args: [parkId, cutoffDate]
+    });
+
+    res.json({ weekdayStats: result.rows });
+
+  } catch (err) {
+    console.error('Fehler in /api/weekday-stats:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
 // ---------- SERVER START ----------
 async function start() {
   try {
