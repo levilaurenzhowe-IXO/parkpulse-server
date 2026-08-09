@@ -11,8 +11,6 @@ app.use(cors());
 app.use(express.json());
 
 // ---------- TURSO DATENBANK VERBINDUNG ----------
-// WICHTIG: URL und Token kommen aus Umgebungsvariablen (Render Dashboard),
-// niemals hier fest eintragen -> sonst landen sie auf GitHub!
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN,
@@ -26,22 +24,13 @@ const PARKS = [
 
 let lastFetchTimestamp = 0;
 
-// ---------- WETTER-KOORDINATEN (Phantasialand, Brühl) ----------
 const PARK_LATITUDE = 50.801472;
 const PARK_LONGITUDE = 6.876355;
 
-// Aktuell gecachtes Wetter, wird alle 15 Min zusammen mit den Wartezeiten
-// aktualisiert (spart unnötige API-Calls zwischen den Fetch-Zyklen)
 let currentWeatherCache = null;
-let currentSchoolHolidayCache = null; // wird 1x täglich aktualisiert
+let currentSchoolHolidayCache = null;
 
-// ---------- DATENBANK-SCHEMA ANLEGEN (einmalig beim Start) ----------
 async function initDatabase() {
-  // Eine Zeile pro Messpunkt pro Attraktion. Das erlaubt uns später beliebige
-  // Auswertungen nach Datum, Wochentag, Uhrzeit, pro Attraktion etc.
-  // Wetter- und Ferienspalten sind bewusst NULLABLE, damit alte, bereits
-  // gespeicherte Zeilen (ohne diese Daten) nicht brechen - ALTER TABLE fügt
-  // sie nachträglich hinzu, falls die Tabelle schon existiert.
   await db.execute(`
     CREATE TABLE IF NOT EXISTS wait_times (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,34 +46,23 @@ async function initDatabase() {
     )
   `);
 
-  // Nachträgliches Hinzufügen neuer Spalten für bereits existierende
-  // Tabellen (ALTER TABLE schlägt fehl, wenn die Spalte schon existiert -
-  // das wird bewusst abgefangen und ignoriert)
   const newColumns = [
-    { name: 'temperature', type: 'REAL' },       // °C
-    { name: 'precipitation', type: 'REAL' },     // mm
-    { name: 'weather_code', type: 'INTEGER' },   // WMO-Wettercode (0=klar, 61=Regen, etc.)
-    { name: 'is_school_holiday', type: 'INTEGER' }, // 0/1 - JA in mind. einer Region (DE-NW/NL/BE/FR/LU)
-    { name: 'holiday_countries', type: 'TEXT' },  // z.B. "Niederlande,Belgien" - welche Länder genau
-    { name: 'is_public_holiday', type: 'INTEGER' } // 0/1 - Feiertag in mind. einer Region
+    { name: 'temperature', type: 'REAL' },
+    { name: 'precipitation', type: 'REAL' },
+    { name: 'weather_code', type: 'INTEGER' },
+    { name: 'is_school_holiday', type: 'INTEGER' },
+    { name: 'holiday_countries', type: 'TEXT' },
+    { name: 'is_public_holiday', type: 'INTEGER' }
   ];
   for (const col of newColumns) {
     try {
       await db.execute(`ALTER TABLE wait_times ADD COLUMN ${col.name} ${col.type}`);
-    } catch (err) {
-      // Spalte existiert bereits - kein Problem, einfach überspringen
-    }
+    } catch (err) {}
   }
 
-  // Indexe für schnelle Abfragen (nach Park+Datum, und nach Attraktion)
   await db.execute(`CREATE INDEX IF NOT EXISTS idx_park_date ON wait_times (park_id, recorded_date)`);
   await db.execute(`CREATE INDEX IF NOT EXISTS idx_ride_name ON wait_times (park_id, ride_name)`);
 
-  // Tabelle für ausgeblendete Attraktionen (pro Park)
-  // HINWEIS: Wird aktuell NICHT vom Frontend genutzt - Ausblenden läuft bewusst
-  // rein lokal über localStorage im Browser (siehe index.html), damit jedes
-  // Familienmitglied eigene Einstellungen hat. Tabelle bleibt für mögliche
-  // spätere Server-Funktionen (z.B. "häufig ausgeblendet") bestehen.
   await db.execute(`
     CREATE TABLE IF NOT EXISTS hidden_rides (
       park_id TEXT NOT NULL,
@@ -96,7 +74,6 @@ async function initDatabase() {
   console.log('✅ Datenbank-Schema bereit.');
 }
 
-// ---------- WETTER ABRUFEN (Open-Meteo, kostenlos, kein API-Key nötig) ----------
 async function fetchCurrentWeather() {
   try {
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${PARK_LATITUDE}&longitude=${PARK_LONGITUDE}&current=temperature_2m,precipitation,weather_code&timezone=Europe%2FBerlin`;
@@ -117,11 +94,6 @@ async function fetchCurrentWeather() {
   }
 }
 
-// ---------- FERIEN & FEIERTAGE (OpenHolidays API, kostenlos, kein Key nötig) ----------
-// Deckt Schulferien UND Feiertage für Deutschland (NRW) sowie die wichtigsten
-// Nachbarländer ab, aus denen Phantasialand-Besucher kommen: Niederlande,
-// Belgien, Frankreich, Luxemburg. Wird 1x täglich aktualisiert und im
-// Arbeitsspeicher gecacht (Ferienzeiträume ändern sich nicht stündlich).
 const HOLIDAY_REGIONS = [
   { country: 'DE', subdivision: 'DE-NW', label: 'Deutschland (NRW)' },
   { country: 'NL', subdivision: null, label: 'Niederlande' },
@@ -141,7 +113,6 @@ async function fetchHolidaysForRegion(endpoint, region, validFrom, validTo) {
     if (!res.ok) return [];
 
     const data = await res.json();
-    // API liefert direkt ein Array (kein Wrapper-Objekt)
     return (Array.isArray(data) ? data : []).map(h => ({
       startDate: h.startDate,
       endDate: h.endDate,
@@ -160,7 +131,7 @@ async function refreshHolidayCache() {
   const now = new Date();
   const validFrom = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
   const future = new Date(now);
-  future.setFullYear(future.getFullYear() + 1); // 1 Jahr im Voraus abdecken
+  future.setFullYear(future.getFullYear() + 1);
   const validTo = future.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
 
   const allSchoolHolidays = [];
@@ -182,8 +153,6 @@ async function refreshHolidayCache() {
   console.log(`-> ${allSchoolHolidays.length} Schulferien-Zeiträume, ${allPublicHolidays.length} Feiertage geladen.`);
 }
 
-// Prüft für ein Datum, ob es in MINDESTENS EINER der Regionen Schulferien sind,
-// und liefert gleich mit, in welchen Ländern genau (für spätere Auswertung)
 function getSchoolHolidayInfo(dateStr) {
   const matches = holidayCache.schoolHolidays.filter(h => dateStr >= h.startDate && dateStr <= h.endDate);
   return {
@@ -201,19 +170,13 @@ function getPublicHolidayInfo(dateStr) {
   };
 }
 
-// Cache 1x täglich auffrischen (Ferientermine ändern sich nicht kurzfristig)
 cron.schedule('0 3 * * *', () => {
   refreshHolidayCache();
 });
 
-
-// ---------- DATEN ABRUFEN UND SPEICHERN ----------
 async function fetchAndSaveData() {
   console.log(`[${new Date().toISOString()}] Starte Datenabruf für alle Parks...`);
 
-  // Wetter einmal pro Zyklus abrufen (gilt für alle Parks gleichermaßen als
-  // Näherung, da alle PARKS aktuell in ähnlicher Klimazone liegen; exakt für
-  // Phantasialand berechnet über PARK_LATITUDE/LONGITUDE)
   currentWeatherCache = await fetchCurrentWeather();
 
   const now = new Date();
@@ -221,7 +184,6 @@ async function fetchAndSaveData() {
   const recordedTime = now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' });
   const weekday = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).getDay();
 
-  // Ferien-Cache initial befüllen, falls noch leer (z.B. direkt nach Serverstart)
   if (holidayCache.lastFetched === 0) {
     await refreshHolidayCache();
   }
@@ -243,8 +205,6 @@ async function fetchAndSaveData() {
         });
       }
 
-      // Alle Attraktionen dieses Parks in einem Batch einfügen (effizienter als einzeln),
-      // jetzt inklusive Wetter- und Ferien-Kontext für spätere Korrelationsanalysen
       const statements = rides.map(r => ({
         sql: `INSERT INTO wait_times
               (park_id, ride_id, ride_name, is_open, wait_time, recorded_at, recorded_date, recorded_time, weekday,
@@ -283,17 +243,10 @@ async function fetchAndSaveData() {
   lastFetchTimestamp = Date.now();
 }
 
-// Alle 15 Minuten automatisch neue Daten holen
 cron.schedule('*/15 * * * *', () => {
   fetchAndSaveData();
 });
 
-// --- API ENDPUNKTE ---
-
-// Health-Check: Wird von einem externen kostenlosen Dienst (z.B. cron-job.org)
-// alle paar Minuten aufgerufen, damit Render den Server nie in den Ruhemodus
-// schickt. So läuft der interne 15-Minuten-Cronjob (oben) durchgehend weiter,
-// auch wenn gerade niemand die App öffnet.
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'ok',
@@ -302,9 +255,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Liefert alles, was das Frontend für die Wetter-/Ferien-Übersichtsbox und
-// den Kalender braucht: aktuelles Wetter, heutiger Ferien-/Feiertagsstatus je
-// Region, sowie die vollständigen Zeiträume für den Kalender (nächste Monate).
 app.get('/api/context', async (req, res) => {
   try {
     if (holidayCache.lastFetched === 0) {
@@ -317,8 +267,6 @@ app.get('/api/context', async (req, res) => {
     const schoolHolidayInfo = getSchoolHolidayInfo(today);
     const publicHolidayInfo = getPublicHolidayInfo(today);
 
-    // Aktives Wetter: falls der Cache noch leer ist (z.B. direkt nach Start),
-    // einmalig live nachladen, statt "null" zurückzugeben
     let weather = currentWeatherCache;
     if (!weather) {
       weather = await fetchCurrentWeather();
@@ -334,8 +282,6 @@ app.get('/api/context', async (req, res) => {
         publicHolidayNames: publicHolidayInfo.names,
         publicHolidayCountries: publicHolidayInfo.countries
       },
-      // Kompletter Kalender für die Anzeige: alle Zeiträume, die in den Cache
-      // geladen sind (aktuell bis 1 Jahr im Voraus, siehe refreshHolidayCache)
       schoolHolidays: holidayCache.schoolHolidays,
       publicHolidays: holidayCache.publicHolidays,
       lastRefreshed: holidayCache.lastFetched ? new Date(holidayCache.lastFetched).toISOString() : null
@@ -347,8 +293,6 @@ app.get('/api/context', async (req, res) => {
   }
 });
 
-// Aktuelle Live-Daten + heutiger Verlauf (ab Parköffnung, also ab dem ersten
-// Messpunkt von heute) für einen Park
 app.get('/api/park', async (req, res) => {
   const parkId = req.query.park || '56';
 
@@ -360,25 +304,20 @@ app.get('/api/park', async (req, res) => {
 
     const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
 
-    // Alle heutigen Messpunkte holen, chronologisch sortiert
     const result = await db.execute({
       sql: `SELECT * FROM wait_times WHERE park_id = ? AND recorded_date = ? ORDER BY recorded_at ASC`,
       args: [parkId, today]
     });
 
-    // Ausgeblendete Attraktionen holen
     const hiddenResult = await db.execute({
       sql: `SELECT ride_name FROM hidden_rides WHERE park_id = ?`,
       args: [parkId]
     });
     const hiddenNames = new Set(hiddenResult.rows.map(r => r.ride_name));
 
-    // Rohdaten (eine Zeile pro Attraktion+Messpunkt) zurück in das alte
-    // "history"-Format gruppieren, das das Frontend erwartet:
-    // [{ time, timestamp, rides: [{name, isOpen, waitTime}, ...] }, ...]
     const grouped = {};
     for (const row of result.rows) {
-      if (hiddenNames.has(row.ride_name)) continue; // ausgeblendete Fahrgeschäfte überspringen
+      if (hiddenNames.has(row.ride_name)) continue;
 
       if (!grouped[row.recorded_at]) {
         grouped[row.recorded_at] = {
@@ -404,7 +343,6 @@ app.get('/api/park', async (req, res) => {
   }
 });
 
-// Attraktion ausblenden / wieder einblenden
 app.post('/api/hidden-rides', async (req, res) => {
   const { parkId, rideName, hidden } = req.body;
 
@@ -431,11 +369,9 @@ app.post('/api/hidden-rides', async (req, res) => {
   }
 });
 
-// Wochentags-/Uhrzeit-Statistik pro Attraktion: durchschnittliche Wartezeit
-// gruppiert nach Wochentag und Stunde -> Basis für Empfehlungen
 app.get('/api/stats', async (req, res) => {
   const parkId = req.query.park || '56';
-  const rideName = req.query.ride; // optional: nur eine bestimmte Attraktion
+  const rideName = req.query.ride;
 
   try {
     let sql = `
@@ -467,7 +403,6 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// Liste aller bekannten Attraktionsnamen eines Parks (für Ausblenden-UI)
 app.get('/api/rides-list', async (req, res) => {
   const parkId = req.query.park || '56';
 
@@ -483,21 +418,15 @@ app.get('/api/rides-list', async (req, res) => {
   }
 });
 
-// ---------- TAGES-STATISTIKEN (Legacy, evtl. später wiederverwendbar) ----------
-//  - dailySummary: pro vergangenem Tag -> Ø Wartezeit, max. gleichzeitige "Besucherlast"
-//  - perRideDaily: pro Tag UND pro Attraktion -> Ø Wartezeit (für die Tabelle)
-//  - averageDay: alle Tage nach Uhrzeit gemittelt -> "so sieht ein durchschnittlicher Tag aus"
 app.get('/api/daily-stats', async (req, res) => {
   const parkId = req.query.park || '56';
-  const days = Math.min(parseInt(req.query.days, 10) || 30, 90); // max. 90 Tage abfragen
+  const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
 
   try {
-    // Älteste noch relevante Datumsgrenze berechnen (heute - X Tage)
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - days);
     const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
 
-    // 1) Pro Tag: Durchschnittliche Wartezeit über alle offenen Attraktionen
     const dailySummaryResult = await db.execute({
       sql: `
         SELECT
@@ -513,7 +442,6 @@ app.get('/api/daily-stats', async (req, res) => {
       args: [parkId, cutoffDate]
     });
 
-    // 2) Pro Tag UND pro Attraktion: Durchschnittliche Wartezeit (für die Tabelle)
     const perRideDailyResult = await db.execute({
       sql: `
         SELECT
@@ -529,8 +457,6 @@ app.get('/api/daily-stats', async (req, res) => {
       args: [parkId, cutoffDate]
     });
 
-    // 3) "Durchschnittstag": alle Tage nach Uhrzeit (HH:MM) gemittelt, über alle
-    // offenen Attraktionen -> zeigt den typischen Tagesverlauf unabhängig vom Datum
     const averageDayResult = await db.execute({
       sql: `
         SELECT
@@ -545,8 +471,6 @@ app.get('/api/daily-stats', async (req, res) => {
       args: [parkId, cutoffDate]
     });
 
-    // 4) Durchschnittstag PRO Attraktion (für den Fall, dass wir das später pro
-    // Attraktion einzeln anzeigen wollen -> schon mitgeliefert, kostet kaum mehr)
     const averageDayPerRideResult = await db.execute({
       sql: `
         SELECT
@@ -574,12 +498,6 @@ app.get('/api/daily-stats', async (req, res) => {
   }
 });
 
-// ---------- NEU: ATTRAKTIONS-BASIERTE STATISTIK ----------
-// (für den neu gestalteten Statistik-Tab: Attraktion wählen -> Kalender -> Tagesverlauf,
-// plus gemittelter Verlauf über einen Zeitraum mit Uhrzeit-Empfehlung)
-
-// Liefert alle Tage, an denen für eine bestimmte Attraktion Daten existieren
-// (für den Kalender im Frontend, damit nur wirklich vorhandene Tage anklickbar sind)
 app.get('/api/ride-days', async (req, res) => {
   const parkId = req.query.park || '56';
   const rideName = req.query.ride;
@@ -600,15 +518,10 @@ app.get('/api/ride-days', async (req, res) => {
   }
 });
 
-// Liefert den Wartezeit-Verlauf für eine Attraktion.
-// Modus 1 (date-Parameter gesetzt): Verlauf genau dieses einen Tages.
-// Modus 2 (kein date, aber days-Parameter): Über den Zeitraum gemittelter
-// Verlauf nach Uhrzeit, PLUS eine automatische Empfehlung für die beste
-// Besuchszeit (Uhrzeit mit der niedrigsten Ø Wartezeit, min. 3 Datenpunkte).
 app.get('/api/ride-history', async (req, res) => {
   const parkId = req.query.park || '56';
   const rideName = req.query.ride;
-  const date = req.query.date; // z.B. "2026-08-07" - optional
+  const date = req.query.date;
   const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
 
   if (!rideName) {
@@ -617,7 +530,6 @@ app.get('/api/ride-history', async (req, res) => {
 
   try {
     if (date) {
-      // Modus 1: Einzelner Tag, chronologischer Verlauf
       const result = await db.execute({
         sql: `
           SELECT recorded_time, is_open, wait_time
@@ -635,7 +547,6 @@ app.get('/api/ride-history', async (req, res) => {
       });
 
     } else {
-      // Modus 2: Über Zeitraum gemittelt, nach Uhrzeit gruppiert
       const cutoff = new Date();
       cutoff.setDate(cutoff.getDate() - days);
       const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
@@ -654,8 +565,6 @@ app.get('/api/ride-history', async (req, res) => {
         args: [parkId, rideName, cutoffDate]
       });
 
-      // Beste Uhrzeit ermitteln: niedrigste Ø Wartezeit, aber nur Zeitpunkte
-      // mit mindestens 3 Messungen berücksichtigen (sonst zu unzuverlässig)
       let bestSlot = null;
       result.rows.forEach(row => {
         if (row.avg_wait === null || row.sample_count < 3) return;
@@ -678,9 +587,6 @@ app.get('/api/ride-history', async (req, res) => {
   }
 });
 
-// Durchschnittliche Wartezeit gruppiert nach Wochentag (über alle Attraktionen
-// und alle Tage im gewählten Zeitraum) -> Basis für den Wochentags-Vergleichsgraf
-// im Statistik-Tab. Zeigt z.B. "Dienstags ist im Schnitt am leersten".
 app.get('/api/weekday-stats', async (req, res) => {
   const parkId = req.query.park || '56';
   const days = Math.min(parseInt(req.query.days, 10) || 90, 180);
@@ -712,12 +618,9 @@ app.get('/api/weekday-stats', async (req, res) => {
   }
 });
 
-// ---------- WETTER-KORRELATION ----------
-// Gruppiert Ø Wartezeit nach Wettercode-Kategorie (klar/bewölkt/regen/etc.)
-// -> zeigt, wie stark das Wetter die Wartezeiten tatsächlich beeinflusst
 app.get('/api/weather-correlation', async (req, res) => {
   const parkId = req.query.park || '56';
-  const rideName = req.query.ride; // optional: nur eine Attraktion
+  const rideName = req.query.ride;
   const days = Math.min(parseInt(req.query.days, 10) || 90, 180);
 
   try {
@@ -762,8 +665,6 @@ app.get('/api/weather-correlation', async (req, res) => {
   }
 });
 
-// ---------- FERIEN-KORRELATION ----------
-// Vergleicht Ø Wartezeit an Schulferien-/Feiertagen vs. normalen Tagen
 app.get('/api/holiday-correlation', async (req, res) => {
   const parkId = req.query.park || '56';
   const rideName = req.query.ride;
@@ -801,12 +702,6 @@ app.get('/api/holiday-correlation', async (req, res) => {
   }
 });
 
-// ---------- ATTRAKTIONS-KORRELATIONEN ----------
-// Findet Attraktionen, deren Wartezeiten sich ähnlich verhalten (gemeinsame
-// Auslastungsspitzen) - nützlich für Ausweich-Empfehlungen in Echtzeit.
-// Nutzt eine vereinfachte Korrelation: für jeden gemeinsamen Zeitpunkt wird
-// verglichen, ob beide Attraktionen relativ zu ihrem eigenen Ø-Wert gleich-
-// zeitig über- oder unterdurchschnittlich ausgelastet waren.
 app.get('/api/ride-correlations', async (req, res) => {
   const parkId = req.query.park || '56';
   const rideName = req.query.ride;
@@ -821,7 +716,6 @@ app.get('/api/ride-correlations', async (req, res) => {
     cutoff.setDate(cutoff.getDate() - days);
     const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
 
-    // Alle Messpunkte der Ziel-Attraktion holen
     const targetResult = await db.execute({
       sql: `
         SELECT recorded_at, wait_time
@@ -838,7 +732,6 @@ app.get('/api/ride-correlations', async (req, res) => {
     const targetMap = new Map(targetResult.rows.map(r => [r.recorded_at, r.wait_time]));
     const targetAvg = targetResult.rows.reduce((sum, r) => sum + r.wait_time, 0) / targetResult.rows.length;
 
-    // Alle anderen Attraktionen im selben Zeitraum holen
     const othersResult = await db.execute({
       sql: `
         SELECT ride_name, recorded_at, wait_time
@@ -848,8 +741,6 @@ app.get('/api/ride-correlations', async (req, res) => {
       args: [parkId, rideName, cutoffDate]
     });
 
-    // Pro andere Attraktion: gemeinsame Zeitpunkte finden und einfache
-    // Korrelation berechnen (übereinstimmende Richtung relativ zum Ø-Wert)
     const grouped = {};
     othersResult.rows.forEach(row => {
       if (!grouped[row.ride_name]) grouped[row.ride_name] = [];
@@ -871,9 +762,9 @@ app.get('/api/ride-correlations', async (req, res) => {
         totalCount++;
       });
 
-      if (totalCount < 10) continue; // zu wenig gemeinsame Datenpunkte
+      if (totalCount < 10) continue;
 
-      const correlationScore = matchCount / totalCount; // 0.5 = keine Korrelation, 1.0 = perfekt gleichläufig
+      const correlationScore = matchCount / totalCount;
       correlations.push({
         rideName: otherName,
         correlationScore: Math.round(correlationScore * 100) / 100,
@@ -881,10 +772,9 @@ app.get('/api/ride-correlations', async (req, res) => {
       });
     }
 
-    // Nach Korrelationsstärke sortieren (am stärksten gleichläufig zuerst)
     correlations.sort((a, b) => b.correlationScore - a.correlationScore);
 
-    res.json({ correlations: correlations.slice(0, 5) }); // Top 5 reichen
+    res.json({ correlations: correlations.slice(0, 5) });
 
   } catch (err) {
     console.error('Fehler in /api/ride-correlations:', err.message);
@@ -892,11 +782,6 @@ app.get('/api/ride-correlations', async (req, res) => {
   }
 });
 
-// ---------- KOMBINIERTE SMARTE PROGNOSE ----------
-// Kombiniert Wochentag + aktuelles Wetter + Ferienstatus + Live-Trend zu einer
-// Vorhersage für die nächsten Stunden. Kein echtes ML-Modell, sondern eine
-// nachvollziehbare, gewichtete Kombination der einzelnen Faktoren - für ein
-// privates Projekt der richtige Kompromiss zwischen Aufwand und Nutzen.
 app.get('/api/smart-forecast', async (req, res) => {
   const parkId = req.query.park || '56';
   const rideName = req.query.ride;
@@ -915,7 +800,6 @@ app.get('/api/smart-forecast', async (req, res) => {
     const schoolHolidayInfo = getSchoolHolidayInfo(today);
     const weather = currentWeatherCache;
 
-    // Basis: historischer Durchschnitt für diesen Wochentag + diese Uhrzeit
     const baseResult = await db.execute({
       sql: `
         SELECT AVG(wait_time) as avg_wait, COUNT(*) as sample_count
@@ -928,8 +812,6 @@ app.get('/api/smart-forecast', async (req, res) => {
     });
     const base = baseResult.rows[0];
 
-    // Anpassungsfaktor durch Ferien (Vergleich Ferien- vs. Nicht-Ferientage
-    // für diese Attraktion, falls genug Daten vorhanden)
     const holidayResult = await db.execute({
       sql: `
         SELECT is_school_holiday, AVG(wait_time) as avg_wait
@@ -949,7 +831,6 @@ app.get('/api/smart-forecast', async (req, res) => {
         : 1;
     }
 
-    // Anpassungsfaktor durch aktuelles Wetter
     let weatherFactor = 1;
     if (weather && weather.weatherCode !== null) {
       const isRainy = weather.weatherCode >= 51 && weather.weatherCode <= 82;
@@ -996,11 +877,176 @@ app.get('/api/smart-forecast', async (req, res) => {
   }
 });
 
-// ---------- SERVER START ----------
+// ---------- NEU: TAGES-PROGNOSE (kombiniert 30-Tage-Ø je Zeit-Slot + Wetter + Ferien) ----------
+// Liefert für jeden 15-Minuten-Slot des heutigen Öffnungszeitraums eine
+// vorhergesagte Wartezeit, basierend auf dem historischen Ø der letzten N Tage
+// für genau diesen Wochentag+Uhrzeit-Slot (bevorzugt), mit Fallback auf den
+// Ø aller Wochentage für diesen Slot falls zu wenig Daten. Das Ergebnis wird
+// zusätzlich mit dem Wetter- und Ferienfaktor aus /api/smart-forecast skaliert,
+// damit ALLE Faktoren (Wochentag, Uhrzeit, Wetter, Ferien) gemeinsam in die
+// Prognose einfließen - für die komplette Tagesvorschau in den Graphen.
+app.get('/api/day-forecast', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const rideName = req.query.ride;
+  const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
+
+  if (!rideName) {
+    return res.status(400).json({ error: 'ride Parameter erforderlich.' });
+  }
+
+  try {
+    const now = new Date();
+    const today = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+    const weekday = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).getDay();
+
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    if (holidayCache.lastFetched === 0) await refreshHolidayCache();
+    const schoolHolidayInfo = getSchoolHolidayInfo(today);
+    const weather = currentWeatherCache;
+
+    // 1) Ø Wartezeit je Uhrzeit-Slot, NUR für denselben Wochentag, letzte N Tage
+    const sameWeekdayResult = await db.execute({
+      sql: `
+        SELECT
+          recorded_time,
+          AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
+          COUNT(CASE WHEN is_open = 1 THEN 1 ELSE NULL END) as sample_count
+        FROM wait_times
+        WHERE park_id = ? AND ride_name = ? AND recorded_date >= ? AND weekday = ?
+        GROUP BY recorded_time
+        ORDER BY recorded_time ASC
+      `,
+      args: [parkId, rideName, cutoffDate, weekday]
+    });
+
+    // 2) Fallback: Ø Wartezeit je Uhrzeit-Slot über ALLE Wochentage, letzte N Tage
+    // (für Slots, wo der gleiche Wochentag zu wenig Datenpunkte hat)
+    const allWeekdaysResult = await db.execute({
+      sql: `
+        SELECT
+          recorded_time,
+          AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
+          COUNT(CASE WHEN is_open = 1 THEN 1 ELSE NULL END) as sample_count
+        FROM wait_times
+        WHERE park_id = ? AND ride_name = ? AND recorded_date >= ?
+        GROUP BY recorded_time
+        ORDER BY recorded_time ASC
+      `,
+      args: [parkId, rideName, cutoffDate]
+    });
+
+    const sameWeekdayMap = new Map(sameWeekdayResult.rows.map(r => [r.recorded_time, r]));
+    const allWeekdaysMap = new Map(allWeekdaysResult.rows.map(r => [r.recorded_time, r]));
+
+    const MIN_SAMPLES_PREFERRED = 3;
+
+    // Alle bekannten Zeit-Slots zusammenführen
+    const allTimes = new Set([...sameWeekdayMap.keys(), ...allWeekdaysMap.keys()]);
+
+    // Ferienfaktor bestimmen (wie in /api/smart-forecast)
+    const holidayResult = await db.execute({
+      sql: `
+        SELECT is_school_holiday, AVG(wait_time) as avg_wait
+        FROM wait_times
+        WHERE park_id = ? AND ride_name = ? AND is_open = 1 AND is_school_holiday IS NOT NULL
+        GROUP BY is_school_holiday
+      `,
+      args: [parkId, rideName]
+    });
+    const holidayRows = holidayResult.rows;
+    const holidayAvgRow = holidayRows.find(r => r.is_school_holiday === 1);
+    const normalAvgRow = holidayRows.find(r => r.is_school_holiday === 0);
+    let holidayFactor = 1;
+    if (holidayAvgRow && normalAvgRow && normalAvgRow.avg_wait > 0) {
+      holidayFactor = schoolHolidayInfo.isHoliday
+        ? (holidayAvgRow.avg_wait / normalAvgRow.avg_wait)
+        : 1;
+    }
+
+    // Wetterfaktor bestimmen (wie in /api/smart-forecast)
+    let weatherFactor = 1;
+    if (weather && weather.weatherCode !== null) {
+      const isRainy = weather.weatherCode >= 51 && weather.weatherCode <= 82;
+      const weatherResult = await db.execute({
+        sql: `
+          SELECT
+            CASE WHEN weather_code BETWEEN 51 AND 82 THEN 1 ELSE 0 END as is_rainy,
+            AVG(wait_time) as avg_wait
+          FROM wait_times
+          WHERE park_id = ? AND ride_name = ? AND is_open = 1 AND weather_code IS NOT NULL
+          GROUP BY is_rainy
+        `,
+        args: [parkId, rideName]
+      });
+      const rainyAvg = weatherResult.rows.find(r => r.is_rainy === 1);
+      const dryAvg = weatherResult.rows.find(r => r.is_rainy === 0);
+      if (isRainy && rainyAvg && dryAvg && dryAvg.avg_wait > 0) {
+        weatherFactor = rainyAvg.avg_wait / dryAvg.avg_wait;
+      }
+    }
+
+    const combinedFactor = holidayFactor * weatherFactor;
+
+    const slots = [];
+    for (const time of allTimes) {
+      const sameRow = sameWeekdayMap.get(time);
+      let baseAvg = null;
+      let sampleCount = 0;
+      let source = null;
+
+      if (sameRow && sameRow.avg_wait !== null && sameRow.sample_count >= MIN_SAMPLES_PREFERRED) {
+        baseAvg = sameRow.avg_wait;
+        sampleCount = sameRow.sample_count;
+        source = 'weekday';
+      } else {
+        const allRow = allWeekdaysMap.get(time);
+        if (allRow && allRow.avg_wait !== null) {
+          baseAvg = allRow.avg_wait;
+          sampleCount = allRow.sample_count;
+          source = 'all-days';
+        }
+      }
+
+      if (baseAvg === null) continue;
+
+      slots.push({
+        time,
+        baseAvg: Math.round(baseAvg * 10) / 10,
+        forecast: Math.max(0, Math.round(baseAvg * combinedFactor)),
+        sampleCount,
+        source
+      });
+    }
+
+    slots.sort((a, b) => a.time.localeCompare(b.time));
+
+    res.json({
+      slots,
+      factors: {
+        isSchoolHoliday: schoolHolidayInfo.isHoliday,
+        holidayCountries: schoolHolidayInfo.countries,
+        holidayFactor: Math.round(holidayFactor * 100) / 100,
+        currentWeather: weather,
+        weatherFactor: Math.round(weatherFactor * 100) / 100,
+        combinedFactor: Math.round(combinedFactor * 100) / 100
+      },
+      basedOnDays: days,
+      weekday
+    });
+
+  } catch (err) {
+    console.error('Fehler in /api/day-forecast:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
 async function start() {
   try {
     await initDatabase();
-    await fetchAndSaveData(); // sofort beim Start erste Daten holen
+    await fetchAndSaveData();
 
     app.listen(PORT, () => {
       console.log(`ParkPulse Server läuft auf Port ${PORT}`);
