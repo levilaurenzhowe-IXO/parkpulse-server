@@ -302,6 +302,51 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Liefert alles, was das Frontend für die Wetter-/Ferien-Übersichtsbox und
+// den Kalender braucht: aktuelles Wetter, heutiger Ferien-/Feiertagsstatus je
+// Region, sowie die vollständigen Zeiträume für den Kalender (nächste Monate).
+app.get('/api/context', async (req, res) => {
+  try {
+    if (holidayCache.lastFetched === 0) {
+      await refreshHolidayCache();
+    }
+
+    const now = new Date();
+    const today = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    const schoolHolidayInfo = getSchoolHolidayInfo(today);
+    const publicHolidayInfo = getPublicHolidayInfo(today);
+
+    // Aktives Wetter: falls der Cache noch leer ist (z.B. direkt nach Start),
+    // einmalig live nachladen, statt "null" zurückzugeben
+    let weather = currentWeatherCache;
+    if (!weather) {
+      weather = await fetchCurrentWeather();
+    }
+
+    res.json({
+      weather,
+      today: {
+        date: today,
+        isSchoolHoliday: schoolHolidayInfo.isHoliday,
+        schoolHolidayCountries: schoolHolidayInfo.countries,
+        isPublicHoliday: publicHolidayInfo.isHoliday,
+        publicHolidayNames: publicHolidayInfo.names,
+        publicHolidayCountries: publicHolidayInfo.countries
+      },
+      // Kompletter Kalender für die Anzeige: alle Zeiträume, die in den Cache
+      // geladen sind (aktuell bis 1 Jahr im Voraus, siehe refreshHolidayCache)
+      schoolHolidays: holidayCache.schoolHolidays,
+      publicHolidays: holidayCache.publicHolidays,
+      lastRefreshed: holidayCache.lastFetched ? new Date(holidayCache.lastFetched).toISOString() : null
+    });
+
+  } catch (err) {
+    console.error('Fehler in /api/context:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
 // Aktuelle Live-Daten + heutiger Verlauf (ab Parköffnung, also ab dem ersten
 // Messpunkt von heute) für einen Park
 app.get('/api/park', async (req, res) => {
