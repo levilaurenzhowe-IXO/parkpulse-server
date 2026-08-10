@@ -1043,6 +1043,258 @@ app.get('/api/day-forecast', async (req, res) => {
   }
 });
 
+// ---------- HILFSFUNKTION: AUSFÄLLE AUS EINER TAGES-ZEITREIHE ERMITTELN ----------
+// Nimmt eine chronologisch sortierte Liste von Messpunkten für EINEN Tag und
+// EINE Attraktion und liefert die erkannten Ausfälle zurück. Regel: alles vor
+// der ersten Öffnung des Tages ist "geplant zu" (späterer reguärer Öffnungs-
+// zeitpunkt der Attraktion) und zählt NICHT als Ausfall. Jede Lücke danach,
+// in der die Attraktion geschlossen ist (is_open=0 oder wait_time=0 während
+// sie vorher offen war), gilt als Ausfall - bis sie wieder öffnet oder der
+// Tag/die Messreihe endet.
+function detectOutagesForDay(pointsChronological) {
+  const outages = [];
+  let firstOpenIndex = -1;
+
+  for (let i = 0; i < pointsChronological.length; i++) {
+    if (pointsChronological[i].is_open) { firstOpenIndex = i; break; }
+  }
+  if (firstOpenIndex === -1) return outages; // Attraktion war den ganzen Tag nie offen
+
+  let outageStart = null;
+  for (let i = firstOpenIndex; i < pointsChronological.length; i++) {
+    const p = pointsChronological[i];
+    const isDown = !p.is_open;
+
+    if (isDown && outageStart === null) {
+      outageStart = p;
+    } else if (!isDown && outageStart !== null) {
+      outages.push({
+        startTime: outageStart.recorded_time,
+        endTime: p.recorded_time,
+        startedAt: outageStart.recorded_at,
+        endedAt: p.recorded_at
+      });
+      outageStart = null;
+    }
+  }
+  // Falls der Tag mit einem laufenden Ausfall endet (z.B. Attraktion bleibt
+  // bis Parkschluss zu), zählt das bis zum letzten Messpunkt des Tages
+  if (outageStart !== null) {
+    const last = pointsChronological[pointsChronological.length - 1];
+    outages.push({
+      startTime: outageStart.recorded_time,
+      endTime: last.recorded_time,
+      startedAt: outageStart.recorded_at,
+      endedAt: last.recorded_at,
+      ongoing: true
+    });
+  }
+
+  return { outages, firstOpenTime: pointsChronological[firstOpenIndex].recorded_time, lastTime: pointsChronological[pointsChronological.length - 1].recorded_time };
+}
+
+// ---------- AUSFÄLLE FÜR EINEN EINZELNEN TAG (für Graphen-Overlay) ----------
+// Liefert die erkannten Ausfall-Zeitfenster für eine Attraktion an einem
+// bestimmten Tag - wird vom Frontend genutzt, um rote Balken in den Live-
+// und Einzeltag-Graphen einzuzeichnen.
+app.get('/api/ride-outages', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const rideName = req.query.ride;
+  const date = req.query.date; // YYYY-MM-DD, optional - default heute
+
+  if (!rideName) {
+    return res.status(400).json({ error: 'ride Parameter erforderlich.' });
+  }
+
+  try {
+    const targetDate = date || new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    const result = await db.execute({
+      sql: `
+        SELECT recorded_time, recorded_at, is_open
+        FROM wait_times
+        WHERE park_id = ? AND ride_name = ? AND recorded_date = ?
+        ORDER BY recorded_at ASC
+      `,
+      args: [parkId, rideName, targetDate]
+    });
+
+    if (result.rows.length === 0) {
+      return res.json({ date: targetDate, outages: [], firstOpenTime: null });
+    }
+
+    const { outages, firstOpenTime } = detectOutagesForDay(result.rows);
+
+    res.json({ date: targetDate, outages, firstOpenTime });
+
+  } catch (err) {
+    console.error('Fehler in /api/ride-outages:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- ZUVERLÄSSIGKEITS-STATISTIK EINER ATTRAKTION ----------
+// Berechnet über einen Zeitraum: Betriebsquote (% der reguären Öffnungszeit,
+// in der die Attraktion tatsächlich lief), Anzahl Ausfälle, Ø Ausfalldauer,
+// und die Uhrzeit(-Stunde), zu der Ausfälle am häufigsten beginnen. "Reguläre
+// Öffnungszeit" = ab der ERSTEN Öffnung des jeweiligen Tages bis zur letzten
+// Messung des Tages (Parkschluss) - so zählt ein späterer reguärer Start
+// (z.B. 11 statt 9 Uhr) NICHT als Ausfall, siehe detectOutagesForDay().
+app.get('/api/ride-reliability', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const rideName = req.query.ride;
+  const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
+
+  if (!rideName) {
+    return res.status(400).json({ error: 'ride Parameter erforderlich.' });
+  }
+
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    const result = await db.execute({
+      sql: `
+        SELECT recorded_date, recorded_time, recorded_at, is_open
+        FROM wait_times
+        WHERE park_id = ? AND ride_name = ? AND recorded_date >= ?
+        ORDER BY recorded_date ASC, recorded_at ASC
+      `,
+      args: [parkId, rideName, cutoffDate]
+    });
+
+    if (result.rows.length === 0) {
+      return res.json({
+        uptimePercent: null, totalOutages: 0, avgOutageDurationMinutes: null,
+        mostCommonOutageHour: null, daysAnalyzed: 0
+      });
+    }
+
+    // Nach Tagen gruppieren
+    const byDay = {};
+    result.rows.forEach(row => {
+      if (!byDay[row.recorded_date]) byDay[row.recorded_date] = [];
+      byDay[row.recorded_date].push(row);
+    });
+
+    let totalOpenMinutes = 0;      // Summe der regulären Öffnungszeit (ab erster Öffnung bis Tagesende)
+    let totalDownMinutes = 0;      // Summe der tatsächlichen Ausfallzeit innerhalb dieser Öffnungszeit
+    let allOutages = [];           // alle erkannten Ausfälle über alle Tage, für Ø-Dauer & häufigste Uhrzeit
+    let daysWithOpeningData = 0;
+
+    // Schätzt die Dauer zwischen zwei Messpunkten in Minuten (üblich: 15 Min
+    // Messintervall) - genutzt um Lücken zwischen Messpunkten zu überbrücken
+    function minutesBetween(timeA, timeB) {
+      const [ha, ma] = timeA.split(':').map(Number);
+      const [hb, mb] = timeB.split(':').map(Number);
+      return (hb * 60 + mb) - (ha * 60 + ma);
+    }
+
+    Object.values(byDay).forEach(dayPoints => {
+      const { outages, firstOpenTime, lastTime } = detectOutagesForDay(dayPoints);
+      if (!firstOpenTime) return; // Attraktion war diesen Tag nie offen -> nicht in Betriebszeit-Berechnung einbeziehen
+
+      daysWithOpeningData++;
+      const openWindowMinutes = Math.max(0, minutesBetween(firstOpenTime, lastTime));
+      totalOpenMinutes += openWindowMinutes;
+
+      outages.forEach(o => {
+        const dur = Math.max(0, minutesBetween(o.startTime, o.endTime));
+        totalDownMinutes += dur;
+        allOutages.push({ ...o, durationMinutes: dur });
+      });
+    });
+
+    const uptimePercent = totalOpenMinutes > 0
+      ? Math.round(((totalOpenMinutes - totalDownMinutes) / totalOpenMinutes) * 1000) / 10
+      : null;
+
+    const avgOutageDurationMinutes = allOutages.length > 0
+      ? Math.round(allOutages.reduce((sum, o) => sum + o.durationMinutes, 0) / allOutages.length)
+      : null;
+
+    // Häufigste Ausfall-Startstunde ermitteln (Modus über alle erkannten Ausfälle)
+    let mostCommonOutageHour = null;
+    if (allOutages.length > 0) {
+      const hourCounts = {};
+      allOutages.forEach(o => {
+        const hour = parseInt(o.startTime.split(':')[0], 10);
+        hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+      });
+      let maxCount = 0;
+      Object.entries(hourCounts).forEach(([hour, count]) => {
+        if (count > maxCount) { maxCount = count; mostCommonOutageHour = parseInt(hour, 10); }
+      });
+    }
+
+    res.json({
+      uptimePercent,
+      totalOutages: allOutages.length,
+      avgOutageDurationMinutes,
+      mostCommonOutageHour,
+      daysAnalyzed: daysWithOpeningData
+    });
+
+  } catch (err) {
+    console.error('Fehler in /api/ride-reliability:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- REGENPERIODEN (für blaue Overlay-Balken in den Graphen) ----------
+// Wandelt die pro-Messpunkt gespeicherten Wettercodes eines Tages in
+// zusammenhängende Regen-Zeitfenster um (Start/Ende), damit das Frontend
+// diese als durchgezogene blaue Balken neben/unter der Wartezeit-Linie
+// einzeichnen kann. "Regen" = WMO-Code 51-82 (Niesel, Regen, Schauer).
+app.get('/api/rain-periods', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const date = req.query.date;
+
+  try {
+    const targetDate = date || new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    // Wetterdaten sind pro Park+Zeitpunkt identisch über alle Attraktionen
+    // gespeichert (siehe fetchAndSaveData) - daher reicht EINE beliebige
+    // Attraktion als Quelle, um die Zeitreihe der Wettercodes zu bekommen.
+    const result = await db.execute({
+      sql: `
+        SELECT recorded_time, recorded_at, weather_code
+        FROM wait_times
+        WHERE park_id = ? AND recorded_date = ? AND weather_code IS NOT NULL
+        GROUP BY recorded_time
+        ORDER BY recorded_at ASC
+      `,
+      args: [parkId, targetDate]
+    });
+
+    const periods = [];
+    let rainStart = null;
+
+    for (let i = 0; i < result.rows.length; i++) {
+      const row = result.rows[i];
+      const isRainy = row.weather_code >= 51 && row.weather_code <= 82;
+
+      if (isRainy && rainStart === null) {
+        rainStart = row;
+      } else if (!isRainy && rainStart !== null) {
+        periods.push({ startTime: rainStart.recorded_time, endTime: row.recorded_time });
+        rainStart = null;
+      }
+    }
+    if (rainStart !== null) {
+      const last = result.rows[result.rows.length - 1];
+      periods.push({ startTime: rainStart.recorded_time, endTime: last.recorded_time, ongoing: true });
+    }
+
+    res.json({ date: targetDate, periods });
+
+  } catch (err) {
+    console.error('Fehler in /api/rain-periods:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
 async function start() {
   try {
     await initDatabase();
