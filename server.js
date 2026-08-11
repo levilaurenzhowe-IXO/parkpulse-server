@@ -52,7 +52,8 @@ async function initDatabase() {
     { name: 'weather_code', type: 'INTEGER' },
     { name: 'is_school_holiday', type: 'INTEGER' },
     { name: 'holiday_countries', type: 'TEXT' },
-    { name: 'is_public_holiday', type: 'INTEGER' }
+    { name: 'is_public_holiday', type: 'INTEGER' },
+    { name: 'is_complete_snapshot', type: 'INTEGER' } // 1 = mind. MIN_RIDES_FOR_CROWD_DATA Attraktionen wurden in diesem Messzyklus gefunden -> für Besucherzahlen-Grafen nutzbar
   ];
   for (const col of newColumns) {
     try {
@@ -205,11 +206,23 @@ async function fetchAndSaveData() {
         });
       }
 
+      // Mindestanzahl an Attraktionen, die queue-times.com für diesen Park
+      // liefern muss, damit dieser Messpunkt als "vollständig" gilt und für
+      // Besucherzahl-/Auslastungs-Berechnungen genutzt werden darf. Fehlen
+      // kurzzeitig Attraktionen in der API-Antwort (kommt gelegentlich vor,
+      // meist nur für einen Zyklus), würde das sonst einen künstlichen
+      // Einbruch im Andrangs-Graphen erzeugen. Wartezeiten selbst werden
+      // trotzdem ganz normal weiter gespeichert - nur das Auslastungs-Flag
+      // wird auf 0 gesetzt, damit das Frontend diesen Zeitpunkt beim
+      // Besucherzahl-Chart überspringen kann.
+      const MIN_RIDES_FOR_CROWD_DATA = 32;
+      const isCompleteSnapshot = rides.length >= MIN_RIDES_FOR_CROWD_DATA ? 1 : 0;
+
       const statements = rides.map(r => ({
         sql: `INSERT INTO wait_times
               (park_id, ride_id, ride_name, is_open, wait_time, recorded_at, recorded_date, recorded_time, weekday,
-               temperature, precipitation, weather_code, is_school_holiday, holiday_countries, is_public_holiday)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               temperature, precipitation, weather_code, is_school_holiday, holiday_countries, is_public_holiday, is_complete_snapshot)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           park.id,
           String(r.id || ''),
@@ -225,7 +238,8 @@ async function fetchAndSaveData() {
           currentWeatherCache ? currentWeatherCache.weatherCode : null,
           schoolHolidayInfo.isHoliday ? 1 : 0,
           schoolHolidayInfo.countries.join(','),
-          publicHolidayInfo.isHoliday ? 1 : 0
+          publicHolidayInfo.isHoliday ? 1 : 0,
+          isCompleteSnapshot
         ]
       }));
 
@@ -233,7 +247,11 @@ async function fetchAndSaveData() {
         await db.batch(statements, 'write');
       }
 
-      console.log(`-> ${park.name} (${park.id}): ${rides.length} Attraktionen gespeichert.`);
+      if (!isCompleteSnapshot) {
+        console.log(`⚠️ ${park.name} (${park.id}): nur ${rides.length} Attraktionen gefunden (< ${MIN_RIDES_FOR_CROWD_DATA}) - Wartezeiten gespeichert, aber als unvollständig für Auslastungs-Berechnung markiert.`);
+      } else {
+        console.log(`-> ${park.name} (${park.id}): ${rides.length} Attraktionen gespeichert.`);
+      }
 
     } catch (err) {
       console.error(`Fehler beim Abruf für ${park.name}:`, err.message);
@@ -245,6 +263,17 @@ async function fetchAndSaveData() {
 
 cron.schedule('*/15 * * * *', () => {
   fetchAndSaveData();
+});
+
+// Wetter separat alle 5 Minuten auffrischen (unabhängig vom 15-Minuten-Zyklus
+// der Wartezeiten-Speicherung), damit /api/context nicht stundenlang denselben
+// Wert zeigt, wenn die App zwischendurch nicht neu geladen wird. Nur der
+// In-Memory-Cache wird aktualisiert - in die DB geschrieben wird das Wetter
+// weiterhin nur zusammen mit den Wartezeiten (alle 15 Min), das reicht für
+// die Korrelationsauswertungen völlig aus.
+cron.schedule('*/5 * * * *', async () => {
+  const fresh = await fetchCurrentWeather();
+  if (fresh) currentWeatherCache = fresh;
 });
 
 app.get('/health', (req, res) => {
@@ -323,7 +352,8 @@ app.get('/api/park', async (req, res) => {
         grouped[row.recorded_at] = {
           time: row.recorded_time,
           timestamp: row.recorded_at,
-          rides: []
+          rides: [],
+          isCompleteSnapshot: !!row.is_complete_snapshot
         };
       }
       grouped[row.recorded_at].rides.push({
@@ -514,6 +544,104 @@ app.get('/api/ride-days', async (req, res) => {
     res.json({ days: result.rows.map(r => r.recorded_date) });
   } catch (err) {
     console.error('Fehler in /api/ride-days:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- AUSLASTUNGS-TAGE (für den neuen Auslastungs-Kalender) ----------
+// Liefert alle Tage, an denen mindestens ein VOLLSTÄNDIGER Snapshot
+// (is_complete_snapshot=1) existiert - nur diese Tage sind für den
+// Auslastungs-Kalender im Statistik-Tab anklickbar/aussagekräftig.
+app.get('/api/crowd-days', async (req, res) => {
+  const parkId = req.query.park || '56';
+
+  try {
+    const result = await db.execute({
+      sql: `SELECT DISTINCT recorded_date FROM wait_times WHERE park_id = ? AND is_complete_snapshot = 1 ORDER BY recorded_date ASC`,
+      args: [parkId]
+    });
+    res.json({ days: result.rows.map(r => r.recorded_date) });
+  } catch (err) {
+    console.error('Fehler in /api/crowd-days:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- AUSLASTUNGS-VERLAUF (Einzeltag ODER über Zeitraum gemittelt) ----------
+// Liefert für jeden Zeit-Slot eines Tages (oder gemittelt über mehrere Tage)
+// ALLE Ride-Wartezeiten dieses Zeitpunkts, damit das Frontend daraus mit der
+// bekannten Kapazitäts-Formel die geschätzte Besucherzahl berechnen kann -
+// exakt wie im Live-Tab, nur eben historisch statt live. Es werden nur
+// vollständige Snapshots (is_complete_snapshot=1) einbezogen, damit kurzzeitig
+// fehlende Attraktionen die Auslastungsschätzung nicht künstlich einbrechen
+// lassen (siehe MIN_RIDES_FOR_CROWD_DATA in fetchAndSaveData).
+app.get('/api/crowd-history', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const date = req.query.date;
+  const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
+
+  try {
+    if (date) {
+      // Modus 1: Einzelner Tag - alle Ride-Wartezeiten pro Zeitpunkt
+      const result = await db.execute({
+        sql: `
+          SELECT recorded_time, recorded_at, ride_name, is_open, wait_time
+          FROM wait_times
+          WHERE park_id = ? AND recorded_date = ? AND is_complete_snapshot = 1
+          ORDER BY recorded_at ASC
+        `,
+        args: [parkId, date]
+      });
+
+      const grouped = {};
+      result.rows.forEach(row => {
+        if (!grouped[row.recorded_at]) {
+          grouped[row.recorded_at] = { time: row.recorded_time, timestamp: row.recorded_at, rides: [] };
+        }
+        grouped[row.recorded_at].rides.push({ name: row.ride_name, isOpen: !!row.is_open, waitTime: row.wait_time });
+      });
+
+      res.json({ mode: 'single-day', date, history: Object.values(grouped).sort((a, b) => a.timestamp - b.timestamp) });
+
+    } else {
+      // Modus 2: Über Zeitraum gemittelt - pro Zeit-Slot der Ø über alle Tage,
+      // getrennt nach Attraktion (damit die Kapazitäts-Formel weiterhin pro
+      // Ride angewendet werden kann, statt einen Gesamt-Ø zu verfälschen)
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - days);
+      const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+      const result = await db.execute({
+        sql: `
+          SELECT
+            recorded_time,
+            ride_name,
+            AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
+            COUNT(DISTINCT recorded_date) as days_counted
+          FROM wait_times
+          WHERE park_id = ? AND recorded_date >= ? AND is_complete_snapshot = 1
+          GROUP BY recorded_time, ride_name
+          ORDER BY recorded_time ASC, ride_name ASC
+        `,
+        args: [parkId, cutoffDate]
+      });
+
+      const grouped = {};
+      result.rows.forEach(row => {
+        if (row.avg_wait === null) return;
+        if (!grouped[row.recorded_time]) grouped[row.recorded_time] = { time: row.recorded_time, rides: [] };
+        grouped[row.recorded_time].rides.push({
+          name: row.ride_name,
+          isOpen: true,
+          waitTime: Math.round(row.avg_wait)
+        });
+      });
+
+      res.json({ mode: 'averaged', days, history: Object.values(grouped).sort((a, b) => a.time.localeCompare(b.time)) });
+    }
+
+  } catch (err) {
+    console.error('Fehler in /api/crowd-history:', err.message);
     res.status(500).json({ error: 'Serverfehler.' });
   }
 });
