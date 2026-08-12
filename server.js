@@ -93,6 +93,24 @@ async function initDatabase() {
     )
   `);
 
+  // Cache für die "intelligente" Ähnlichkeits-Prognose (siehe
+  // computeSmartForecast()). Die Berechnung durchsucht potenziell sehr viele
+  // historische Tage und darf bewusst etwas dauern - wird deshalb NICHT bei
+  // jeder Anfrage neu gerechnet, sondern pro Attraktion gecacht und nur neu
+  // berechnet, wenn sich die relevanten Einflussfaktoren (Wetter/Ferien/
+  // bisheriger Tagesverlauf) seit der letzten Berechnung wirklich geändert
+  // haben oder der Cache älter als 15 Minuten ist.
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS forecast_cache (
+      park_id TEXT NOT NULL,
+      ride_name TEXT NOT NULL,
+      computed_at INTEGER NOT NULL,
+      factors_fingerprint TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      PRIMARY KEY (park_id, ride_name)
+    )
+  `);
+
   console.log('✅ Datenbank-Schema bereit.');
 }
 
@@ -1382,6 +1400,12 @@ app.get('/api/day-forecast', async (req, res) => {
 // closeTime (z.B. für sehr alte Daten ohne gespeicherte Öffnungszeiten)
 // fällt die Funktion auf ihr bisheriges Verhalten zurück (letzter Messpunkt
 // des Tages = Ende der Betriebszeit).
+// Wie viele Minuten vor der bekannten Park-Schließzeit ein "Ausfall" nicht
+// mehr als solcher gezählt wird, sondern als normales, ggf. vorgezogenes
+// Ende der Attraktion (viele Warteschlangen schließen schon 15-30 Min vor
+// dem eigentlichen Parkschluss, das ist kein technischer Defekt).
+const PRE_CLOSING_GRACE_MINUTES = 30;
+
 function detectOutagesForDay(pointsChronological, closeTime = null) {
   const outages = [];
   let firstOpenIndex = -1;
@@ -1399,22 +1423,29 @@ function detectOutagesForDay(pointsChronological, closeTime = null) {
     if (isDown && outageStart === null) {
       outageStart = p;
     } else if (!isDown && outageStart !== null) {
-      outages.push({
-        startTime: outageStart.recorded_time,
-        endTime: p.recorded_time,
-        startedAt: outageStart.recorded_at,
-        endedAt: p.recorded_at
-      });
+      // Nur als echten Ausfall werten, wenn er NICHT innerhalb der letzten
+      // PRE_CLOSING_GRACE_MINUTES vor Parkschluss begonnen hat - gilt für
+      // JEDEN Ausfall im Tagesverlauf, nicht nur einen laufenden am Tagesende,
+      // da manche Attraktionen schon deutlich vor offiziellem Parkschluss
+      // ihre Warteschlange regulär schließen.
+      const startsBeforeClosingGrace = !closeTime
+        || minutesBetweenTimes(outageStart.recorded_time, closeTime) > PRE_CLOSING_GRACE_MINUTES;
+      if (startsBeforeClosingGrace) {
+        outages.push({
+          startTime: outageStart.recorded_time,
+          endTime: p.recorded_time,
+          startedAt: outageStart.recorded_at,
+          endedAt: p.recorded_at
+        });
+      }
       outageStart = null;
     }
   }
-  // Falls der Tag mit einem laufenden "Ausfall" endet: nur als echten Ausfall
-  // werten, wenn er VOR der bekannten Park-Schließzeit begann (mit 15 Min
-  // Toleranz, da Messzyklen alle 15 Min laufen) - sonst ist das schlicht das
-  // normale Tagesende und wird verworfen, nicht als Ausfall gezählt.
+  // Falls der Tag mit einem laufenden "Ausfall" endet: dieselbe Regel gilt
+  // auch hier (siehe oben) - nur zählen, wenn er deutlich vor Parkschluss begann.
   if (outageStart !== null) {
     const last = pointsChronological[pointsChronological.length - 1];
-    const outageIsBeforeClose = !closeTime || minutesBetweenTimes(outageStart.recorded_time, closeTime) > 15;
+    const outageIsBeforeClose = !closeTime || minutesBetweenTimes(outageStart.recorded_time, closeTime) > PRE_CLOSING_GRACE_MINUTES;
     if (outageIsBeforeClose) {
       outages.push({
         startTime: outageStart.recorded_time,
@@ -1654,6 +1685,443 @@ app.get('/api/rain-periods', async (req, res) => {
 
   } catch (err) {
     console.error('Fehler in /api/rain-periods:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// =====================================================================
+// ================ INTELLIGENTE ÄHNLICHKEITS-PROGNOSE ================
+// =====================================================================
+// Statt einfach den Ø der letzten N Tage für denselben Wochentag+Uhrzeit-Slot
+// zu nehmen, sucht dieser Ansatz unter ALLEN verfügbaren historischen Tagen
+// diejenigen, die dem heutigen Tag am ähnlichsten sind - nach Wochentyp
+// (Wochenende/Werktag), Schulferien-Situation (welche Länder betroffen),
+// Feiertag, Wetterlage (Regen/trocken, Temperaturband) UND dem tatsächlichen
+// bisherigen bzw. gesamten Besucheraufkommen des Tages. Nur diese ähnlichen
+// Tage fließen dann gewichtet in die Prognose ein. Das ist bewusst rechen-
+// aufwändig und wird deshalb serverseitig gecacht (siehe forecast_cache).
+
+// Wandelt einen Wettercode in eine grobe Kategorie um (für den Ähnlichkeits-
+// vergleich reicht "regnet es" + "wie warm", ein exakter Codevergleich wäre
+// zu streng und würde kaum je zwei "identische" Tage finden)
+function weatherCategoryFromCode(code) {
+  if (code === null || code === undefined) return 'unbekannt';
+  if (code === 0 || code === 1) return 'klar';
+  if (code <= 3) return 'bewoelkt';
+  if (code >= 45 && code <= 48) return 'nebel';
+  if (code >= 51 && code <= 67) return 'regen';
+  if (code >= 71 && code <= 77) return 'schnee';
+  if (code >= 80 && code <= 82) return 'schauer';
+  if (code >= 95) return 'gewitter';
+  return 'sonstiges';
+}
+function temperatureBand(temp) {
+  if (temp === null || temp === undefined) return 'unbekannt';
+  if (temp < 5) return 'kalt';
+  if (temp < 15) return 'kuehl';
+  if (temp < 22) return 'mild';
+  if (temp < 28) return 'warm';
+  return 'heiss';
+}
+
+// Baut ein "Tagesprofil" aus den in wait_times gespeicherten Rohdaten für
+// EINEN Tag (parkweit, über alle Attraktionen gemittelt) - wird sowohl für
+// den heutigen Tag (bisheriger Verlauf) als auch für jeden historischen
+// Vergleichstag gebraucht.
+function buildDayProfile(dayRows, weekday) {
+  if (dayRows.length === 0) return null;
+
+  const isWeekend = weekday === 0 || weekday === 6;
+  const isSchoolHoliday = dayRows.some(r => r.is_school_holiday === 1);
+  const holidayCountriesSet = new Set();
+  dayRows.forEach(r => { if (r.holiday_countries) r.holiday_countries.split(',').forEach(c => { if (c) holidayCountriesSet.add(c); }); });
+  const isPublicHoliday = dayRows.some(r => r.is_public_holiday === 1);
+
+  const weatherCodes = dayRows.map(r => r.weather_code).filter(c => c !== null && c !== undefined);
+  const dominantWeatherCode = weatherCodes.length > 0
+    ? weatherCodes.sort((a, b) =>
+        weatherCodes.filter(v => v === a).length - weatherCodes.filter(v => v === b).length
+      ).pop()
+    : null;
+  const temps = dayRows.map(r => r.temperature).filter(t => t !== null && t !== undefined);
+  const avgTemp = temps.length > 0 ? temps.reduce((a, b) => a + b, 0) / temps.length : null;
+
+  // Besucheraufkommen-Proxy: Ø Wartezeit über alle offenen Attraktionen an
+  // diesem Tag (einfach, aber wirkungsvoll - korreliert stark mit echtem Andrang)
+  const openWaits = dayRows.filter(r => r.is_open === 1).map(r => r.wait_time);
+  const avgWait = openWaits.length > 0 ? openWaits.reduce((a, b) => a + b, 0) / openWaits.length : null;
+
+  return {
+    isWeekend,
+    isSchoolHoliday,
+    holidayCountries: holidayCountriesSet,
+    isPublicHoliday,
+    weatherCategory: weatherCategoryFromCode(dominantWeatherCode),
+    temperatureBand: temperatureBand(avgTemp),
+    avgWait // Proxy fürs Besucheraufkommen
+  };
+}
+
+// Ähnlichkeits-Score zwischen zwei Tagesprofilen: 0 (völlig unähnlich) bis 1
+// (praktisch identisch). Gewichtung ist bewusst so gewählt, dass das
+// TATSÄCHLICHE Besucheraufkommen (avgWait) am stärksten zählt - das ist die
+// ehrlichste, direkteste Kennzahl dafür, wie voll der Park an einem Tag war,
+// stärker als jeder einzelne Einflussfaktor für sich.
+function dayProfileSimilarity(a, b) {
+  if (!a || !b) return 0;
+  let score = 0;
+  let maxScore = 0;
+
+  // Wochenende/Werktag: harter Faktor, da sich das Verhalten stark unterscheidet
+  maxScore += 2; if (a.isWeekend === b.isWeekend) score += 2;
+
+  // Schulferien: ja/nein UND möglichst dieselben Länder betroffen
+  maxScore += 2;
+  if (a.isSchoolHoliday === b.isSchoolHoliday) {
+    score += 1;
+    if (a.isSchoolHoliday) {
+      const overlap = [...a.holidayCountries].filter(c => b.holidayCountries.has(c)).length;
+      const union = new Set([...a.holidayCountries, ...b.holidayCountries]).size;
+      score += union > 0 ? overlap / union : 1;
+    } else {
+      score += 1;
+    }
+  }
+
+  maxScore += 1; if (a.isPublicHoliday === b.isPublicHoliday) score += 1;
+
+  maxScore += 1; if (a.weatherCategory === b.weatherCategory) score += 1;
+  maxScore += 1; if (a.temperatureBand === b.temperatureBand) score += 1;
+
+  // Besucheraufkommen (avgWait) - stärkstes Gewicht, da direkteste Kennzahl
+  maxScore += 3;
+  if (a.avgWait !== null && b.avgWait !== null) {
+    const diff = Math.abs(a.avgWait - b.avgWait);
+    const relCloseness = Math.max(0, 1 - diff / Math.max(a.avgWait, b.avgWait, 10));
+    score += relCloseness * 3;
+  }
+
+  return maxScore > 0 ? score / maxScore : 0;
+}
+
+const SIMILARITY_THRESHOLD = 0.55; // Mindest-Ähnlichkeit, damit ein Tag überhaupt einfließt
+const MAX_SIMILAR_DAYS = 60;       // Deckel nach oben, um den Server nicht zu überlasten
+
+// Baut für ALLE verfügbaren Tage eines Rides (über alle wait_times-Zeilen,
+// nicht nur der letzten N Tage) das Tagesprofil und vergleicht mit dem
+// heutigen (bisherigen) Profil. Gibt eine nach Ähnlichkeit sortierte Liste
+// zurück. days_lookback begrenzt optional, wie weit zurück gesucht wird
+// (0/undefined = unbegrenzt, "so viele wie sie findet").
+async function findSimilarDays(parkId, rideName, todayProfile, daysLookback) {
+  let sql = `
+    SELECT recorded_date, weekday, is_open, wait_time, weather_code, temperature,
+           is_school_holiday, holiday_countries, is_public_holiday
+    FROM wait_times
+    WHERE park_id = ? AND ride_name = ?
+  `;
+  const args = [parkId, rideName];
+  if (daysLookback) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - daysLookback);
+    sql += ` AND recorded_date >= ?`;
+    args.push(cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' }));
+  }
+
+  const result = await db.execute({ sql, args });
+  if (result.rows.length === 0) return [];
+
+  const byDay = {};
+  result.rows.forEach(row => {
+    if (!byDay[row.recorded_date]) byDay[row.recorded_date] = [];
+    byDay[row.recorded_date].push(row);
+  });
+
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+  const scored = [];
+  Object.entries(byDay).forEach(([date, rows]) => {
+    if (date === today) return; // heutiger Tag selbst zählt nicht als "Vergleichstag"
+    const weekday = rows[0].weekday;
+    const profile = buildDayProfile(rows, weekday);
+    const similarity = dayProfileSimilarity(todayProfile, profile);
+    if (similarity >= SIMILARITY_THRESHOLD) {
+      scored.push({ date, weekday, similarity, rows });
+    }
+  });
+
+  scored.sort((a, b) => b.similarity - a.similarity);
+  return scored.slice(0, MAX_SIMILAR_DAYS);
+}
+
+// Erzeugt einen kurzen "Fingerabdruck" der aktuellen Einflussfaktoren, um zu
+// erkennen, ob eine neue Berechnung überhaupt nötig ist (z.B. wenn sich das
+// Wetter seit der letzten Cache-Berechnung geändert hat) oder der Cache
+// weiterhin gültig ist, auch wenn er älter als der reine Zeitstempel-Check
+// erlauben würde.
+function buildFactorsFingerprint(todayProfile, currentHour) {
+  return JSON.stringify({
+    w: todayProfile.isWeekend,
+    sh: todayProfile.isSchoolHoliday,
+    hc: [...todayProfile.holidayCountries].sort(),
+    ph: todayProfile.isPublicHoliday,
+    wc: todayProfile.weatherCategory,
+    tb: todayProfile.temperatureBand,
+    // avgWait grob gebändert (nicht exakt), damit kleine Schwankungen keine
+    // Neuberechnung erzwingen, ein wirklich anderer Andrang aber schon
+    aw: todayProfile.avgWait !== null ? Math.round(todayProfile.avgWait / 5) * 5 : null,
+    hour: currentHour
+  });
+}
+
+const FORECAST_CACHE_MAX_AGE_MS = 15 * 60 * 1000; // 15 Minuten
+
+// Kernfunktion: berechnet (oder liefert aus dem Cache) die intelligente
+// Prognose für eine Attraktion. Liefert:
+// - forecastSlots: Vorhersage für die nächsten paar Stunden (nicht den ganzen
+//   Tag), berechnet aus dem gewichteten Mittel der ähnlichsten Tage
+// - similarDaysCount: wie viele Tage tatsächlich einflossen
+// - riskWindows: Zeitfenster (können mehrere sein, mit Range), in denen bei
+//   den ähnlichen Tagen historisch am häufigsten Ausfälle auftraten
+async function computeSmartForecast(parkId, rideName) {
+  const now = new Date();
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const currentHour = now.getHours();
+
+  // Cache prüfen
+  const cacheRow = await db.execute({
+    sql: `SELECT computed_at, factors_fingerprint, result_json FROM forecast_cache WHERE park_id = ? AND ride_name = ?`,
+    args: [parkId, rideName]
+  });
+
+  // Heutiges (bisheriges) Tagesprofil bauen - Basis für den Ähnlichkeitsvergleich
+  const today = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+  const todayRowsResult = await db.execute({
+    sql: `SELECT is_open, wait_time, weather_code, temperature, is_school_holiday, holiday_countries, is_public_holiday
+          FROM wait_times WHERE park_id = ? AND recorded_date = ?`,
+    args: [parkId, today]
+  });
+  const weekday = now.getDay();
+  const todayProfile = buildDayProfile(todayRowsResult.rows, weekday) || {
+    isWeekend: weekday === 0 || weekday === 6, isSchoolHoliday: false, holidayCountries: new Set(),
+    isPublicHoliday: false, weatherCategory: 'unbekannt', temperatureBand: 'unbekannt', avgWait: null
+  };
+
+  const fingerprint = buildFactorsFingerprint(todayProfile, currentHour);
+
+  if (cacheRow.rows.length > 0) {
+    const cached = cacheRow.rows[0];
+    const age = Date.now() - cached.computed_at;
+    if (age < FORECAST_CACHE_MAX_AGE_MS && cached.factors_fingerprint === fingerprint) {
+      return JSON.parse(cached.result_json);
+    }
+  }
+
+  // Ähnliche Tage suchen (unbegrenzter Lookback - "so viele wie sie findet",
+  // aber MAX_SIMILAR_DAYS als Deckel gegen Serverlast)
+  const similarDays = await findSimilarDays(parkId, rideName, todayProfile, null);
+
+  // Fallback: keine ausreichend ähnlichen Tage gefunden -> einfacher
+  // Wochentags-Ø der letzten 60 Tage als Rückfallebene, klar markiert
+  if (similarDays.length === 0) {
+    const fallbackResult = await db.execute({
+      sql: `
+        SELECT recorded_time, AVG(CASE WHEN is_open=1 THEN wait_time ELSE NULL END) as avg_wait, COUNT(*) as n
+        FROM wait_times
+        WHERE park_id = ? AND ride_name = ? AND weekday = ? AND recorded_date >= ?
+        GROUP BY recorded_time ORDER BY recorded_time ASC
+      `,
+      args: [parkId, rideName, weekday, new Date(Date.now() - 60 * 86400000).toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' })]
+    });
+    const slots = fallbackResult.rows
+      .filter(r => r.avg_wait !== null)
+      .map(r => ({ time: r.recorded_time, forecast: Math.round(r.avg_wait), confidence: 'niedrig', basis: 'wochentag-fallback' }));
+
+    const result = { slots: filterToNextHours(slots, nowMinutes), similarDaysCount: 0, method: 'fallback', riskWindows: [] };
+    await saveForecastCache(parkId, rideName, fingerprint, result);
+    return result;
+  }
+
+  // Gewichtete Prognose je Zeit-Slot aus den ähnlichen Tagen berechnen -
+  // Gewicht = Ähnlichkeits-Score, damit sehr ähnliche Tage stärker zählen als
+  // nur knapp über der Schwelle liegende
+  const slotAccumulator = {}; // { "HH:MM": { weightedSum, weightTotal } }
+
+  // recorded_time steht nicht in den oben aus findSimilarDays gelieferten
+  // rows (wurde dort nicht selektiert) - daher hier gezielt nachladen, aber
+  // NUR für die bereits gefundenen ähnlichen Tage (kein voller Tabellenscan)
+  const similarDates = similarDays.map(d => d.date);
+  const placeholders = similarDates.map(() => '?').join(',');
+  const detailResult = await db.execute({
+    sql: `
+      SELECT recorded_date, recorded_time, is_open, wait_time
+      FROM wait_times
+      WHERE park_id = ? AND ride_name = ? AND recorded_date IN (${placeholders})
+    `,
+    args: [parkId, rideName, ...similarDates]
+  });
+  const similarityByDate = {};
+  similarDays.forEach(d => { similarityByDate[d.date] = d.similarity; });
+
+  detailResult.rows.forEach(row => {
+    if (row.is_open !== 1) return; // Ausfälle fließen nicht in den Prognosewert ein (siehe Anforderung)
+    const weight = similarityByDate[row.recorded_date] || 0;
+    if (weight <= 0) return;
+    if (!slotAccumulator[row.recorded_time]) slotAccumulator[row.recorded_time] = { weightedSum: 0, weightTotal: 0, n: 0 };
+    slotAccumulator[row.recorded_time].weightedSum += row.wait_time * weight;
+    slotAccumulator[row.recorded_time].weightTotal += weight;
+    slotAccumulator[row.recorded_time].n++;
+  });
+
+  const allSlots = Object.entries(slotAccumulator)
+    .filter(([, acc]) => acc.weightTotal > 0 && acc.n >= 2) // mind. 2 Datenpunkte pro Slot
+    .map(([time, acc]) => ({
+      time,
+      forecast: Math.round(acc.weightedSum / acc.weightTotal),
+      confidence: acc.n >= 8 ? 'hoch' : acc.n >= 4 ? 'mittel' : 'niedrig',
+      basis: 'aehnliche-tage',
+      sampleCount: acc.n
+    }))
+    .sort((a, b) => a.time.localeCompare(b.time));
+
+  // Risiko-Zeitfenster: bei den ähnlichen Tagen die Uhrzeiten sammeln, zu
+  // denen Ausfälle begannen, und zu zusammenhängenden Ranges gruppieren
+  // (z.B. "12:00-13:00" statt einzelner Minutenwerte) - Parkschluss-nahe
+  // "Ausfälle" wurden serverseitig in detectOutagesForDay() bereits
+  // rausgefiltert (siehe PRE_CLOSING_GRACE_MINUTES), fließen hier also nicht
+  // fälschlich als Risiko-Zeit ein.
+  const riskWindows = await computeRiskWindows(parkId, rideName, similarDates);
+
+  const result = {
+    slots: filterToNextHours(allSlots, nowMinutes),
+    similarDaysCount: similarDays.length,
+    method: 'aehnlichkeit',
+    avgSimilarity: Math.round((similarDays.reduce((s, d) => s + d.similarity, 0) / similarDays.length) * 100) / 100,
+    riskWindows
+  };
+
+  await saveForecastCache(parkId, rideName, fingerprint, result);
+  return result;
+}
+
+// Begrenzt die Prognose auf die nächsten paar Stunden ab jetzt (nicht den
+// ganzen Tag) - wie gewünscht reicht ein realistischer Vorschau-Horizont,
+// weiter in der Zukunft liegende Slots werden ohnehin unsicherer.
+const FORECAST_HORIZON_MINUTES = 240; // 4 Stunden
+function filterToNextHours(slots, nowMinutes) {
+  return slots.filter(s => {
+    const [h, m] = s.time.split(':').map(Number);
+    const slotMinutes = h * 60 + m;
+    const delta = slotMinutes - nowMinutes;
+    return delta >= -15 && delta <= FORECAST_HORIZON_MINUTES; // kleiner Puffer rückwärts für nahtlosen Übergang
+  });
+}
+
+async function saveForecastCache(parkId, rideName, fingerprint, result) {
+  try {
+    await db.execute({
+      sql: `INSERT INTO forecast_cache (park_id, ride_name, computed_at, factors_fingerprint, result_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(park_id, ride_name) DO UPDATE SET computed_at=excluded.computed_at, factors_fingerprint=excluded.factors_fingerprint, result_json=excluded.result_json`,
+      args: [parkId, rideName, Date.now(), fingerprint, JSON.stringify(result)]
+    });
+  } catch (err) {
+    console.error('Fehler beim Cachen der Prognose:', err.message);
+  }
+}
+
+// Ermittelt Zeitfenster mit gehäuften Ausfällen unter den ähnlichen Tagen.
+// Gruppiert Ausfall-Startzeiten in Stunden-Buckets, findet Buckets mit
+// überdurchschnittlich vielen Ausfällen, und fasst benachbarte auffällige
+// Buckets zu einer Range zusammen (z.B. "12:00-13:00" statt zwei einzelnen
+// Meldungen für 12 und 13 Uhr).
+async function computeRiskWindows(parkId, rideName, similarDates) {
+  if (similarDates.length === 0) return [];
+
+  const placeholders = similarDates.map(() => '?').join(',');
+  const rowsResult = await db.execute({
+    sql: `
+      SELECT recorded_date, recorded_time, recorded_at, is_open
+      FROM wait_times
+      WHERE park_id = ? AND ride_name = ? AND recorded_date IN (${placeholders})
+      ORDER BY recorded_date ASC, recorded_at ASC
+    `,
+    args: [parkId, rideName, ...similarDates]
+  });
+
+  const byDay = {};
+  rowsResult.rows.forEach(row => {
+    if (!byDay[row.recorded_date]) byDay[row.recorded_date] = [];
+    byDay[row.recorded_date].push(row);
+  });
+
+  // Für jeden Tag die bekannte Schließzeit holen (für den 30-Min-Puffer)
+  const closeTimesResult = await db.execute({
+    sql: `SELECT date, close_time FROM park_opening_hours WHERE park_id = ? AND date IN (${placeholders})`,
+    args: [parkId, ...similarDates]
+  });
+  const closeTimeByDate = {};
+  closeTimesResult.rows.forEach(r => { closeTimeByDate[r.date] = r.close_time; });
+
+  const hourBuckets = {}; // { 0-23: count }
+  let totalDaysWithData = 0;
+  Object.entries(byDay).forEach(([date, rows]) => {
+    const { outages } = detectOutagesForDay(rows, closeTimeByDate[date] || null);
+    if (outages.length > 0) totalDaysWithData++;
+    outages.forEach(o => {
+      const hour = parseInt(o.startTime.split(':')[0], 10);
+      hourBuckets[hour] = (hourBuckets[hour] || 0) + 1;
+    });
+  });
+
+  const totalOutages = Object.values(hourBuckets).reduce((a, b) => a + b, 0);
+  if (totalOutages === 0) return [];
+
+  // Nur Stunden aufnehmen, die überdurchschnittlich oft betroffen sind
+  // (mind. 2 Vorkommnisse UND mind. 15% aller Ausfälle dieser Stunde)
+  const significantHours = Object.entries(hourBuckets)
+    .filter(([, count]) => count >= 2 && count / totalOutages >= 0.15)
+    .map(([hour]) => parseInt(hour, 10))
+    .sort((a, b) => a - b);
+
+  if (significantHours.length === 0) return [];
+
+  // Benachbarte Stunden zu Ranges zusammenfassen
+  const windows = [];
+  let rangeStart = significantHours[0];
+  let rangeEnd = significantHours[0];
+  for (let i = 1; i < significantHours.length; i++) {
+    if (significantHours[i] === rangeEnd + 1) {
+      rangeEnd = significantHours[i];
+    } else {
+      windows.push({ startHour: rangeStart, endHour: rangeEnd + 1, occurrences: hourBuckets[rangeStart] });
+      rangeStart = significantHours[i];
+      rangeEnd = significantHours[i];
+    }
+  }
+  windows.push({ startHour: rangeStart, endHour: rangeEnd + 1, occurrences: hourBuckets[rangeStart] });
+
+  return windows.map(w => ({
+    startTime: `${String(w.startHour).padStart(2, '0')}:00`,
+    endTime: `${String(w.endHour).padStart(2, '0')}:00`,
+    // Anteil der ähnlichen Tage, an denen in diesem Fenster ein Ausfall begann
+    frequencyPercent: totalDaysWithData > 0 ? Math.round((w.occurrences / totalDaysWithData) * 100) : null
+  }));
+}
+
+// ---------- ENDPOINT: Intelligente Prognose ----------
+app.get('/api/smart-day-forecast', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const rideName = req.query.ride;
+
+  if (!rideName) {
+    return res.status(400).json({ error: 'ride Parameter erforderlich.' });
+  }
+
+  try {
+    const result = await computeSmartForecast(parkId, rideName);
+    res.json(result);
+  } catch (err) {
+    console.error('Fehler in /api/smart-day-forecast:', err.message);
     res.status(500).json({ error: 'Serverfehler.' });
   }
 });
