@@ -72,6 +72,27 @@ async function initDatabase() {
     )
   `);
 
+  // Speichert die für einen Tag ermittelten Park-Öffnungszeiten, damit wir
+  // (a) historisch nachvollziehen können, wann der Park wie lange offen war
+  // (wichtig für Prognosen), und (b) im Live-Betrieb zuverlässig zwischen
+  // "Attraktion ausgefallen" und "Park schon/noch geschlossen" unterscheiden
+  // können. source markiert, ob die Zeiten erfolgreich von wartezeiten.app
+  // gescraped wurden ('scraped'), aus einer alten erfolgreichen Abfrage
+  // desselben Tages weiterverwendet wurden ('stale'), oder der harte
+  // Notfall-Fallback 9-19 Uhr griff, weil gar nichts anderes verfügbar war
+  // ('fallback') - siehe fetchParkOpeningHours().
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS park_opening_hours (
+      park_id TEXT NOT NULL,
+      date TEXT NOT NULL,
+      open_time TEXT NOT NULL,
+      close_time TEXT NOT NULL,
+      source TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (park_id, date)
+    )
+  `);
+
   console.log('✅ Datenbank-Schema bereit.');
 }
 
@@ -94,6 +115,115 @@ async function fetchCurrentWeather() {
     return null;
   }
 }
+
+// ---------- ÖFFNUNGSZEITEN (von wartezeiten.app gescraped) ----------
+// wartezeiten.app hat kein öffentliches JSON-API für Öffnungszeiten, daher
+// wird die Live-Seite geladen und der Text "Von HH:MM bis HH:MM Uhr geöffnet"
+// per Regex extrahiert. Das ist bewusst FEHLERTOLERANT aufgebaut, mit drei
+// Stufen (siehe fetchParkOpeningHours):
+//   1. Erfolgreich gescraped -> source='scraped', wird in der DB gespeichert
+//   2. Scraping schlägt fehl, aber es gibt für HEUTE bereits einen früheren
+//      erfolgreichen Scrape -> dieser wird weiterverwendet, source='stale'
+//   3. Scraping schlägt fehl UND es gibt noch keinen erfolgreichen Scrape für
+//      heute -> harter Notfall-Fallback 09:00-19:00 Uhr, source='fallback'
+// In JEDEM Fall (auch bei Erfolg) wird zusätzlich global vermerkt, ob der
+// letzte Scrape-VERSUCH geklappt hat (lastOpeningHoursScrapeError) - das
+// Frontend zeigt dem Nutzer eine Warnung, wenn der Scraper zuletzt fehlschlug,
+// auch wenn dank Fallback weiterhin Öffnungszeiten angezeigt werden.
+const WARTEZEITEN_APP_URL = 'https://www.wartezeiten.app/phantasialand/';
+const OPENING_HOURS_FALLBACK = { openTime: '09:00', closeTime: '19:00' };
+let lastOpeningHoursScrapeError = null; // null = letzter Versuch war OK, sonst Fehlermeldung
+let lastOpeningHoursScrapeAttempt = 0;
+
+async function scrapeOpeningHoursFromWartezeitenApp() {
+  const res = await fetch(WARTEZEITEN_APP_URL, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ParkPulse/1.0; +https://github.com/)' }
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} von wartezeiten.app`);
+
+  const html = await res.text();
+
+  // Geschlossen-Fall zuerst prüfen (z.B. Wartungstag außerhalb der Saison)
+  if (/(heute|park)\s+geschlossen/i.test(html)) {
+    return { openTime: null, closeTime: null, closed: true };
+  }
+
+  const match = html.match(/Von\s+(\d{1,2}):(\d{2})\s+bis\s+(\d{1,2}):(\d{2})\s+Uhr\s+geöffnet/i);
+  if (!match) {
+    throw new Error('Öffnungszeiten-Text nicht im HTML gefunden (Seitenlayout evtl. geändert)');
+  }
+
+  const openTime = `${match[1].padStart(2, '0')}:${match[2]}`;
+  const closeTime = `${match[3].padStart(2, '0')}:${match[4]}`;
+  return { openTime, closeTime, closed: false };
+}
+
+// Holt/aktualisiert die Öffnungszeiten für HEUTE mit dem oben beschriebenen
+// dreistufigen Fallback. Wird stündlich per Cron aufgerufen UND einmalig
+// beim Serverstart, damit auch nach einem Neustart sofort valide Zeiten da
+// sind, statt bis zur nächsten vollen Stunde zu warten.
+async function refreshOpeningHours(parkId = '56') {
+  lastOpeningHoursScrapeAttempt = Date.now();
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+  try {
+    const scraped = await scrapeOpeningHoursFromWartezeitenApp();
+    lastOpeningHoursScrapeError = null; // Versuch war erfolgreich
+
+    if (scraped.closed) {
+      // Park heute laut Website komplett geschlossen (z.B. Wartungstag) -
+      // trotzdem als "scraped" speichern, damit das Frontend das korrekt
+      // von einem Ausfall unterscheiden kann (open_time=close_time markiert das)
+      await db.execute({
+        sql: `INSERT INTO park_opening_hours (park_id, date, open_time, close_time, source, updated_at)
+              VALUES (?, ?, ?, ?, 'scraped', ?)
+              ON CONFLICT(park_id, date) DO UPDATE SET open_time=excluded.open_time, close_time=excluded.close_time, source=excluded.source, updated_at=excluded.updated_at`,
+        args: [parkId, today, '00:00', '00:00', Date.now()]
+      });
+      console.log(`🚪 Öffnungszeiten ${today}: Park laut wartezeiten.app heute geschlossen.`);
+      return;
+    }
+
+    await db.execute({
+      sql: `INSERT INTO park_opening_hours (park_id, date, open_time, close_time, source, updated_at)
+            VALUES (?, ?, ?, ?, 'scraped', ?)
+            ON CONFLICT(park_id, date) DO UPDATE SET open_time=excluded.open_time, close_time=excluded.close_time, source=excluded.source, updated_at=excluded.updated_at`,
+      args: [parkId, today, scraped.openTime, scraped.closeTime, Date.now()]
+    });
+    console.log(`🕐 Öffnungszeiten ${today}: ${scraped.openTime}-${scraped.closeTime} Uhr (von wartezeiten.app).`);
+
+  } catch (err) {
+    lastOpeningHoursScrapeError = err.message;
+    console.error('⚠️ Fehler beim Scrapen der Öffnungszeiten:', err.message);
+
+    // Stufe 2: gibt es für HEUTE bereits einen früher erfolgreich gescrapeten
+    // Eintrag? Dann diesen einfach stehen lassen (source bleibt 'scraped',
+    // aber wir markieren den Fehlversuch separat über lastOpeningHoursScrapeError)
+    const existing = await db.execute({
+      sql: `SELECT * FROM park_opening_hours WHERE park_id = ? AND date = ?`,
+      args: [parkId, today]
+    });
+    if (existing.rows.length > 0) {
+      console.log(`↩️ Verwende weiterhin die zuletzt erfolgreich geladenen Öffnungszeiten für ${today}.`);
+      return;
+    }
+
+    // Stufe 3: gar nichts vorhanden -> harter Notfall-Fallback 9-19 Uhr
+    await db.execute({
+      sql: `INSERT INTO park_opening_hours (park_id, date, open_time, close_time, source, updated_at)
+            VALUES (?, ?, ?, ?, 'fallback', ?)
+            ON CONFLICT(park_id, date) DO NOTHING`,
+      args: [parkId, today, OPENING_HOURS_FALLBACK.openTime, OPENING_HOURS_FALLBACK.closeTime, Date.now()]
+    });
+    console.log(`🆘 Notfall-Fallback für ${today}: ${OPENING_HOURS_FALLBACK.openTime}-${OPENING_HOURS_FALLBACK.closeTime} Uhr.`);
+  }
+}
+
+// Stündlicher Scrape (schont die fremde Seite, reagiert aber noch zeitnah
+// auf spontane Verlängerungen/Verkürzungen der Öffnungszeit)
+cron.schedule('0 * * * *', () => {
+  refreshOpeningHours();
+});
 
 const HOLIDAY_REGIONS = [
   { country: 'DE', subdivision: 'DE-NW', label: 'Deutschland (NRW)' },
@@ -284,6 +414,67 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ---------- ÖFFNUNGSZEITEN ABRUFEN (für heute, mit Fehler-Transparenz) ----------
+// Liefert die aktuell bekannten Öffnungszeiten für heute PLUS Informationen
+// darüber, wie zuverlässig diese sind: source ('scraped'/'fallback'),
+// scrapeError (falls der letzte Scrape-Versuch fehlschlug, auch wenn dank
+// Fallback trotzdem Zeiten verfügbar sind) und wie lange der letzte
+// erfolgreiche Scrape her ist. Das Frontend nutzt scrapeError, um dem
+// Nutzer sichtbar zu machen, dass der automatische Abruf gerade klemmt.
+app.get('/api/opening-hours', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const date = req.query.date || new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+  try {
+    const result = await db.execute({
+      sql: `SELECT * FROM park_opening_hours WHERE park_id = ? AND date = ?`,
+      args: [parkId, date]
+    });
+
+    const isToday = date === new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    if (result.rows.length === 0) {
+      // Für heute sollte refreshOpeningHours() beim Start/stündlich bereits
+      // einen Eintrag angelegt haben - falls nicht (z.B. ganz frischer Start,
+      // Cron noch nicht gelaufen), hier synchron nachholen statt leer zu antworten
+      if (isToday) {
+        await refreshOpeningHours(parkId);
+        const retry = await db.execute({
+          sql: `SELECT * FROM park_opening_hours WHERE park_id = ? AND date = ?`,
+          args: [parkId, date]
+        });
+        if (retry.rows.length > 0) {
+          const row = retry.rows[0];
+          return res.json({
+            date, openTime: row.open_time, closeTime: row.close_time, source: row.source,
+            closed: row.open_time === row.close_time,
+            scrapeError: isToday ? lastOpeningHoursScrapeError : null,
+            lastScrapeAttempt: lastOpeningHoursScrapeAttempt ? new Date(lastOpeningHoursScrapeAttempt).toISOString() : null
+          });
+        }
+      }
+      return res.json({ date, openTime: null, closeTime: null, source: 'none', closed: null, scrapeError: lastOpeningHoursScrapeError });
+    }
+
+    const row = result.rows[0];
+    res.json({
+      date,
+      openTime: row.open_time,
+      closeTime: row.close_time,
+      source: row.source,
+      closed: row.open_time === row.close_time,
+      // scrapeError nur für HEUTE relevant zeigen - historische Tage sollen
+      // nicht durch einen aktuellen Scrape-Fehler als "unzuverlässig" markiert wirken
+      scrapeError: isToday ? lastOpeningHoursScrapeError : null,
+      lastScrapeAttempt: lastOpeningHoursScrapeAttempt ? new Date(lastOpeningHoursScrapeAttempt).toISOString() : null
+    });
+
+  } catch (err) {
+    console.error('Fehler in /api/opening-hours:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
 app.get('/api/context', async (req, res) => {
   try {
     if (holidayCache.lastFetched === 0) {
@@ -301,6 +492,10 @@ app.get('/api/context', async (req, res) => {
       weather = await fetchCurrentWeather();
     }
 
+    // Öffnungszeiten werden bewusst NICHT hier dupliziert, sondern über den
+    // dedizierten /api/opening-hours Endpoint geliefert (unterstützt auch
+    // historische Daten und liefert den detaillierten Scrape-Fehlerstatus).
+    // Das Frontend ruft beide Endpoints parallel ab.
     res.json({
       weather,
       today: {
@@ -1179,7 +1374,15 @@ app.get('/api/day-forecast', async (req, res) => {
 // in der die Attraktion geschlossen ist (is_open=0 oder wait_time=0 während
 // sie vorher offen war), gilt als Ausfall - bis sie wieder öffnet oder der
 // Tag/die Messreihe endet.
-function detectOutagesForDay(pointsChronological) {
+// Erkennt Ausfälle innerhalb der Betriebszeit einer Attraktion an einem Tag.
+// closeTime (optional, "HH:MM") ist die bekannte Park-Schließzeit dieses
+// Tages (aus park_opening_hours) - wird genutzt, um einen "Ausfall", der
+// genau bis zum offiziellen Parkschluss andauert, NICHT als echten Ausfall
+// gegen die Attraktion zu werten, sondern als normales Tagesende. Ohne
+// closeTime (z.B. für sehr alte Daten ohne gespeicherte Öffnungszeiten)
+// fällt die Funktion auf ihr bisheriges Verhalten zurück (letzter Messpunkt
+// des Tages = Ende der Betriebszeit).
+function detectOutagesForDay(pointsChronological, closeTime = null) {
   const outages = [];
   let firstOpenIndex = -1;
 
@@ -1205,20 +1408,33 @@ function detectOutagesForDay(pointsChronological) {
       outageStart = null;
     }
   }
-  // Falls der Tag mit einem laufenden Ausfall endet (z.B. Attraktion bleibt
-  // bis Parkschluss zu), zählt das bis zum letzten Messpunkt des Tages
+  // Falls der Tag mit einem laufenden "Ausfall" endet: nur als echten Ausfall
+  // werten, wenn er VOR der bekannten Park-Schließzeit begann (mit 15 Min
+  // Toleranz, da Messzyklen alle 15 Min laufen) - sonst ist das schlicht das
+  // normale Tagesende und wird verworfen, nicht als Ausfall gezählt.
   if (outageStart !== null) {
     const last = pointsChronological[pointsChronological.length - 1];
-    outages.push({
-      startTime: outageStart.recorded_time,
-      endTime: last.recorded_time,
-      startedAt: outageStart.recorded_at,
-      endedAt: last.recorded_at,
-      ongoing: true
-    });
+    const outageIsBeforeClose = !closeTime || minutesBetweenTimes(outageStart.recorded_time, closeTime) > 15;
+    if (outageIsBeforeClose) {
+      outages.push({
+        startTime: outageStart.recorded_time,
+        endTime: last.recorded_time,
+        startedAt: outageStart.recorded_at,
+        endedAt: last.recorded_at,
+        ongoing: true
+      });
+    }
   }
 
   return { outages, firstOpenTime: pointsChronological[firstOpenIndex].recorded_time, lastTime: pointsChronological[pointsChronological.length - 1].recorded_time };
+}
+
+// Minuten zwischen zwei "HH:MM"-Zeitstempeln (b - a), für Vergleiche wie
+// "liegt der Ausfallbeginn deutlich vor Parkschluss?"
+function minutesBetweenTimes(timeA, timeB) {
+  const [ha, ma] = timeA.split(':').map(Number);
+  const [hb, mb] = timeB.split(':').map(Number);
+  return (hb * 60 + mb) - (ha * 60 + ma);
 }
 
 // ---------- AUSFÄLLE FÜR EINEN EINZELNEN TAG (für Graphen-Overlay) ----------
@@ -1251,9 +1467,18 @@ app.get('/api/ride-outages', async (req, res) => {
       return res.json({ date: targetDate, outages: [], firstOpenTime: null });
     }
 
-    const { outages, firstOpenTime } = detectOutagesForDay(result.rows);
+    // Bekannte Park-Schließzeit für diesen Tag laden, damit ein "Ausfall" der
+    // exakt bis Parkschluss dauert nicht fälschlich als Attraktions-Ausfall
+    // gewertet wird (siehe detectOutagesForDay)
+    const hoursResult = await db.execute({
+      sql: `SELECT close_time FROM park_opening_hours WHERE park_id = ? AND date = ?`,
+      args: [parkId, targetDate]
+    });
+    const closeTime = hoursResult.rows.length > 0 ? hoursResult.rows[0].close_time : null;
 
-    res.json({ date: targetDate, outages, firstOpenTime });
+    const { outages, firstOpenTime } = detectOutagesForDay(result.rows, closeTime);
+
+    res.json({ date: targetDate, outages, firstOpenTime, parkCloseTime: closeTime });
 
   } catch (err) {
     console.error('Fehler in /api/ride-outages:', err.message);
@@ -1306,6 +1531,16 @@ app.get('/api/ride-reliability', async (req, res) => {
       byDay[row.recorded_date].push(row);
     });
 
+    // Bekannte Park-Schließzeiten für alle betroffenen Tage in einem Rutsch
+    // laden (statt einzeln pro Tag), damit "Ausfall genau bis Parkschluss"
+    // auch hier korrekt NICHT als Attraktions-Ausfall gezählt wird
+    const closeTimesResult = await db.execute({
+      sql: `SELECT date, close_time FROM park_opening_hours WHERE park_id = ? AND date >= ?`,
+      args: [parkId, cutoffDate]
+    });
+    const closeTimeByDate = {};
+    closeTimesResult.rows.forEach(r => { closeTimeByDate[r.date] = r.close_time; });
+
     let totalOpenMinutes = 0;      // Summe der regulären Öffnungszeit (ab erster Öffnung bis Tagesende)
     let totalDownMinutes = 0;      // Summe der tatsächlichen Ausfallzeit innerhalb dieser Öffnungszeit
     let allOutages = [];           // alle erkannten Ausfälle über alle Tage, für Ø-Dauer & häufigste Uhrzeit
@@ -1319,8 +1554,8 @@ app.get('/api/ride-reliability', async (req, res) => {
       return (hb * 60 + mb) - (ha * 60 + ma);
     }
 
-    Object.values(byDay).forEach(dayPoints => {
-      const { outages, firstOpenTime, lastTime } = detectOutagesForDay(dayPoints);
+    Object.entries(byDay).forEach(([date, dayPoints]) => {
+      const { outages, firstOpenTime, lastTime } = detectOutagesForDay(dayPoints, closeTimeByDate[date] || null);
       if (!firstOpenTime) return; // Attraktion war diesen Tag nie offen -> nicht in Betriebszeit-Berechnung einbeziehen
 
       daysWithOpeningData++;
@@ -1427,6 +1662,7 @@ async function start() {
   try {
     await initDatabase();
     await fetchAndSaveData();
+    await refreshOpeningHours(); // sofort beim Start Öffnungszeiten laden, nicht erst zur nächsten vollen Stunde warten
 
     app.listen(PORT, () => {
       console.log(`ParkPulse Server läuft auf Port ${PORT}`);
