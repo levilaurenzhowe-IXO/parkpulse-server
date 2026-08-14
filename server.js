@@ -409,19 +409,15 @@ async function fetchAndSaveData() {
   lastFetchTimestamp = Date.now();
 }
 
-cron.schedule('*/15 * * * *', () => {
+// Wartezeiten (und damit auch das aktuelle Wetter, siehe fetchAndSaveData)
+// werden jetzt alle 5 Minuten abgerufen und gespeichert, statt alle 15
+// Minuten. Das gilt für ALLE Attraktionen und für den Wetter-Snapshot, der
+// bei jedem Speichervorgang mit aktualisiert wird - ein separater 5-Minuten-
+// Wetter-Cronjob ist dadurch nicht mehr nötig, da beide jetzt denselben Takt
+// haben und der Wetter-Cache ohnehin bei jedem fetchAndSaveData()-Durchlauf
+// mit aktualisiert wird.
+cron.schedule('*/5 * * * *', () => {
   fetchAndSaveData();
-});
-
-// Wetter separat alle 5 Minuten auffrischen (unabhängig vom 15-Minuten-Zyklus
-// der Wartezeiten-Speicherung), damit /api/context nicht stundenlang denselben
-// Wert zeigt, wenn die App zwischendurch nicht neu geladen wird. Nur der
-// In-Memory-Cache wird aktualisiert - in die DB geschrieben wird das Wetter
-// weiterhin nur zusammen mit den Wartezeiten (alle 15 Min), das reicht für
-// die Korrelationsauswertungen völlig aus.
-cron.schedule('*/5 * * * *', async () => {
-  const fresh = await fetchCurrentWeather();
-  if (fresh) currentWeatherCache = fresh;
 });
 
 app.get('/health', (req, res) => {
@@ -539,7 +535,10 @@ app.get('/api/park', async (req, res) => {
   const parkId = req.query.park || '56';
 
   try {
-    if (Date.now() - lastFetchTimestamp > 10 * 60 * 1000) {
+    // Schwelle an den 5-Minuten-Speichertakt angepasst (statt vorher 10 Min
+    // bei 15-Minuten-Takt) - etwas mehr als das doppelte Intervall, damit ein
+    // einzelner verpasster Zyklus nicht sofort einen zusätzlichen Live-Abruf auslöst
+    if (Date.now() - lastFetchTimestamp > 7 * 60 * 1000) {
       console.log('Server war inaktiv, hole frische Daten...');
       await fetchAndSaveData();
     }
@@ -1406,6 +1405,16 @@ app.get('/api/day-forecast', async (req, res) => {
 // dem eigentlichen Parkschluss, das ist kein technischer Defekt).
 const PRE_CLOSING_GRACE_MINUTES = 30;
 
+// Fallback-Schließzeit für historische Tage, an denen park_opening_hours
+// (noch) keinen Eintrag hat - z.B. weil das Öffnungszeiten-Scraping erst
+// nachträglich eingeführt wurde. OHNE diesen Fallback würde
+// detectOutagesForDay() den Puffer für solche Tage gar nicht anwenden können
+// und die letzten Messungen des Tages fälschlich als "Ausfallbeginn" zählen
+// (führte zum Bug: 19-20 Uhr erschien als "häufigste Ausfallzeit", obwohl der
+// Park da einfach nur regulär schließt). 19:00 ist die typische
+// Phantasialand-Schließzeit außerhalb der Hauptsaison.
+const DEFAULT_CLOSE_TIME_FALLBACK = '19:00';
+
 function detectOutagesForDay(pointsChronological, closeTime = null) {
   const outages = [];
   let firstOpenIndex = -1;
@@ -1586,7 +1595,7 @@ app.get('/api/ride-reliability', async (req, res) => {
     }
 
     Object.entries(byDay).forEach(([date, dayPoints]) => {
-      const { outages, firstOpenTime, lastTime } = detectOutagesForDay(dayPoints, closeTimeByDate[date] || null);
+      const { outages, firstOpenTime, lastTime } = detectOutagesForDay(dayPoints, closeTimeByDate[date] || DEFAULT_CLOSE_TIME_FALLBACK);
       if (!firstOpenTime) return; // Attraktion war diesen Tag nie offen -> nicht in Betriebszeit-Berechnung einbeziehen
 
       daysWithOpeningData++;
@@ -2065,7 +2074,7 @@ async function computeRiskWindows(parkId, rideName, similarDates) {
   const hourBuckets = {}; // { 0-23: count }
   let totalDaysWithData = 0;
   Object.entries(byDay).forEach(([date, rows]) => {
-    const { outages } = detectOutagesForDay(rows, closeTimeByDate[date] || null);
+    const { outages } = detectOutagesForDay(rows, closeTimeByDate[date] || DEFAULT_CLOSE_TIME_FALLBACK);
     if (outages.length > 0) totalDaysWithData++;
     outages.forEach(o => {
       const hour = parseInt(o.startTime.split(':')[0], 10);
@@ -2129,6 +2138,21 @@ app.get('/api/smart-day-forecast', async (req, res) => {
 async function start() {
   try {
     await initDatabase();
+
+    // Einmaliger Reset des Prognose-Caches beim Start: die Ausfallerkennung
+    // wurde gerade korrigiert (30-Min-Puffer vor Parkschluss greift jetzt
+    // zuverlässig auch für historische Tage ohne bekannte Öffnungszeiten,
+    // siehe DEFAULT_CLOSE_TIME_FALLBACK). Alte, mit der fehlerhaften Logik
+    // berechnete Cache-Einträge (z.B. "19-20 Uhr = häufigste Ausfallzeit")
+    // würden sonst bis zu 15 Minuten oder bis zur nächsten Faktoränderung
+    // weiterhin ausgeliefert. Betrifft nur den Cache, nicht die Rohdaten.
+    try {
+      await db.execute(`DELETE FROM forecast_cache`);
+      console.log('🔄 Prognose-Cache zurückgesetzt (korrigierte Ausfallerkennung).');
+    } catch (err) {
+      console.error('Konnte Prognose-Cache nicht zurücksetzen:', err.message);
+    }
+
     await fetchAndSaveData();
     await refreshOpeningHours(); // sofort beim Start Öffnungszeiten laden, nicht erst zur nächsten vollen Stunde warten
 
