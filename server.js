@@ -905,9 +905,36 @@ app.get('/api/ride-history', async (req, res) => {
         args: [parkId, rideName, cutoffDate]
       });
 
+      // Heutige (bzw. zuletzt bekannte) Öffnungszeiten holen, um die
+      // Empfehlung strikt auf den Zeitraum ZWISCHEN Parköffnung und
+      // -schließung (mit demselben 30-Min-Puffer vor Schließung wie bei der
+      // Ausfallerkennung) zu begrenzen. Ohne diesen Filter konnte die
+      // "beste Zeit"-Empfehlung auf Slots kurz vor der offiziellen Öffnung
+      // fallen, wo einzelne Attraktionen durch fehlerhafte Live-Meldungen
+      // künstlich niedrige Wartezeiten hatten - das ergab keinen Sinn, da der
+      // Park zu dem Zeitpunkt noch gar nicht offen war.
+      const todayForHours = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+      let hoursRow = await db.execute({
+        sql: `SELECT open_time, close_time FROM park_opening_hours WHERE park_id = ? AND date = ?`,
+        args: [parkId, todayForHours]
+      });
+      let openTimeBound = '09:00';
+      let closeTimeBound = '19:00';
+      if (hoursRow.rows.length > 0) {
+        openTimeBound = hoursRow.rows[0].open_time || openTimeBound;
+        closeTimeBound = hoursRow.rows[0].close_time || closeTimeBound;
+      }
+      // 30-Minuten-Puffer vor Schließung abziehen (gleiche Logik wie
+      // PRE_CLOSING_GRACE_MINUTES bei der Ausfallerkennung)
+      const [ch, cm] = closeTimeBound.split(':').map(Number);
+      const closeBoundMinutes = Math.max(0, ch * 60 + cm - 30);
+      const recommendationCutoffTime = `${String(Math.floor(closeBoundMinutes / 60)).padStart(2, '0')}:${String(closeBoundMinutes % 60).padStart(2, '0')}`;
+
       let bestSlot = null;
       result.rows.forEach(row => {
         if (row.avg_wait === null || row.sample_count < 3) return;
+        // Slot muss innerhalb der Öffnungszeit liegen (mit Schließ-Puffer)
+        if (row.recorded_time < openTimeBound || row.recorded_time > recommendationCutoffTime) return;
         if (!bestSlot || row.avg_wait < bestSlot.avg_wait) {
           bestSlot = { time: row.recorded_time, avgWait: row.avg_wait, sampleCount: row.sample_count };
         }
