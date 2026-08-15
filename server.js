@@ -1,7 +1,11 @@
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
-const fetch = require('node-fetch');
+// Kein node-fetch mehr nötig: Node.js 18+ bringt ein natives, globales
+// fetch() mit (stabil seit Node 21), das exakt dieselbe Fetch-API wie im
+// Browser bereitstellt. Der Import entfällt komplett, der restliche Code
+// bleibt unverändert, da überall bereits die Standard-fetch()-Syntax genutzt
+// wird. Setzt Node >= 18 voraus (siehe "engines" in package.json).
 const { createClient } = require('@libsql/client');
 
 const app = express();
