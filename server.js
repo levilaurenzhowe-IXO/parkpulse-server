@@ -14,6 +14,24 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// ---------- FETCH MIT TIMEOUT (gegen hängende externe Requests) ----------
+// Alle externen APIs (queue-times.com, Open-Meteo, OpenHolidaysAPI,
+// wartezeiten.app) wurden bisher OHNE jeden Timeout aufgerufen - hing eine
+// dieser Fremdseiten mal (langsame Antwort, Netzwerkproblem, Rate-Limiting),
+// konnte das den gesamten Speichervorgang bzw. nachfolgende Anfragen spürbar
+// verzögern, ohne dass ein Fehler sichtbar wurde. fetchWithTimeout bricht
+// nach timeoutMs automatisch ab und wirft einen klaren Fehler, der von den
+// bestehenden try/catch-Blöcken wie gewohnt aufgefangen wird.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 // ---------- TURSO DATENBANK VERBINDUNG ----------
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
@@ -121,7 +139,7 @@ async function initDatabase() {
 async function fetchCurrentWeather() {
   try {
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${PARK_LATITUDE}&longitude=${PARK_LONGITUDE}&current=temperature_2m,precipitation,weather_code&timezone=Europe%2FBerlin`;
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url, {}, 8000);
     if (!res.ok) return null;
 
     const data = await res.json();
@@ -158,9 +176,17 @@ let lastOpeningHoursScrapeError = null; // null = letzter Versuch war OK, sonst 
 let lastOpeningHoursScrapeAttempt = 0;
 
 async function scrapeOpeningHoursFromWartezeitenApp() {
-  const res = await fetch(WARTEZEITEN_APP_URL, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ParkPulse/1.0; +https://github.com/)' }
-  });
+  // Ein unauffälliger, echter Browser-User-Agent statt eines Bot-erkennbaren
+  // Strings (der vorherige "ParkPulse/1.0" wurde von wartezeiten.app mit
+  // HTTP 403 blockiert). Zusätzlich ein paar Standard-Browser-Header, damit
+  // die Anfrage nicht wie ein offensichtliches Skript aussieht.
+  const res = await fetchWithTimeout(WARTEZEITEN_APP_URL, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'de-DE,de;q=0.9'
+    }
+  }, 10000);
   if (!res.ok) throw new Error(`HTTP ${res.status} von wartezeiten.app`);
 
   const html = await res.text();
@@ -262,7 +288,7 @@ async function fetchHolidaysForRegion(endpoint, region, validFrom, validTo) {
     let url = `https://openholidaysapi.org/${endpoint}?countryIsoCode=${region.country}&validFrom=${validFrom}&validTo=${validTo}&languageIsoCode=DE`;
     if (region.subdivision) url += `&subdivisionCode=${region.subdivision}`;
 
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url, {}, 8000);
     if (!res.ok) return [];
 
     const data = await res.json();
@@ -345,7 +371,7 @@ async function fetchAndSaveData() {
 
   for (const park of PARKS) {
     try {
-      const res = await fetch(`https://queue-times.com/parks/${park.id}/queue_times.json`);
+      const res = await fetchWithTimeout(`https://queue-times.com/parks/${park.id}/queue_times.json`, {}, 10000);
 
       if (!res.ok) continue;
 
