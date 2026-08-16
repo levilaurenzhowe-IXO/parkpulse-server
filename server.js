@@ -273,7 +273,37 @@ cron.schedule('0 * * * *', () => {
   refreshOpeningHours();
 });
 
+// Für den Ferienkalender-Tab wird "Deutschland" als EINE Zeile dargestellt,
+// die zeigt, ob IRGENDEIN Bundesland gerade Ferien hat (Vereinigung aller 16
+// Bundesländer), statt nur NRW zu zeigen. Dafür müssen alle 16 Bundesländer
+// einzeln abgefragt werden (die API liefert Ferien pro Bundesland getrennt).
+// Die einzelnen Bundesland-Namen bleiben dabei erhalten (fließen weiterhin in
+// is_school_holiday/holiday_countries für die Attraktions-Prognose ein, siehe
+// getSchoolHolidayInfo), werden aber im NEUEN Ferienkalender-Tab zu "Deutschland"
+// zusammengefasst (siehe /api/holidays-overview weiter unten).
+const GERMAN_STATE_CODES = [
+  { code: 'DE-BW', name: 'Baden-Württemberg' },
+  { code: 'DE-BY', name: 'Bayern' },
+  { code: 'DE-BE', name: 'Berlin' },
+  { code: 'DE-BB', name: 'Brandenburg' },
+  { code: 'DE-HB', name: 'Bremen' },
+  { code: 'DE-HH', name: 'Hamburg' },
+  { code: 'DE-HE', name: 'Hessen' },
+  { code: 'DE-MV', name: 'Mecklenburg-Vorpommern' },
+  { code: 'DE-NI', name: 'Niedersachsen' },
+  { code: 'DE-NW', name: 'Nordrhein-Westfalen' },
+  { code: 'DE-RP', name: 'Rheinland-Pfalz' },
+  { code: 'DE-SL', name: 'Saarland' },
+  { code: 'DE-SN', name: 'Sachsen' },
+  { code: 'DE-ST', name: 'Sachsen-Anhalt' },
+  { code: 'DE-SH', name: 'Schleswig-Holstein' },
+  { code: 'DE-TH', name: 'Thüringen' }
+];
+
 const HOLIDAY_REGIONS = [
+  // NRW bleibt als bevorzugte Region für die Attraktions-Prognosen (Wetter/
+  // Ferien-Einfluss auf Wartezeiten) bestehen, da der Park in NRW liegt und
+  // NRW-Besucher den größten Einzelanteil ausmachen dürften.
   { country: 'DE', subdivision: 'DE-NW', label: 'Deutschland (NRW)' },
   { country: 'NL', subdivision: null, label: 'Niederlande' },
   { country: 'BE', subdivision: null, label: 'Belgien' },
@@ -281,7 +311,37 @@ const HOLIDAY_REGIONS = [
   { country: 'LU', subdivision: null, label: 'Luxemburg' }
 ];
 
-let holidayCache = { schoolHolidays: [], publicHolidays: [], lastFetched: 0 };
+let holidayCache = { schoolHolidays: [], publicHolidays: [], germanUnion: [], lastFetched: 0 };
+
+// Führt überlappende oder direkt aneinander angrenzende Datumsbereiche zu
+// einem einzigen zusammenhängenden Zeitraum zusammen (Vereinigung/Union).
+// Wird genutzt, um aus 16 einzelnen Bundesland-Ferienlisten EINE
+// "Deutschland gesamt"-Zeitleiste zu bauen, in der jeder Tag, an dem
+// mindestens ein Bundesland Ferien hat, als durchgehender grüner Balken
+// erscheint - genau wie im Referenzdesign (schulferien.org).
+function mergeDateRanges(ranges) {
+  if (ranges.length === 0) return [];
+  const sorted = [...ranges].sort((a, b) => a.startDate.localeCompare(b.startDate));
+  const merged = [sorted[0]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const current = sorted[i];
+    const last = merged[merged.length - 1];
+    // Direkt angrenzend (nächster Tag nach dem bisherigen Ende) zählt auch
+    // als zusammenhängend, damit z.B. "Ferien Land A bis 16., Land B ab 17."
+    // nicht künstlich als zwei getrennte grüne Balken mit Lücke erscheint
+    const nextDayAfterLast = new Date(last.endDate);
+    nextDayAfterLast.setDate(nextDayAfterLast.getDate() + 1);
+    const nextDayStr = nextDayAfterLast.toLocaleDateString('sv-SE');
+
+    if (current.startDate <= nextDayStr) {
+      if (current.endDate > last.endDate) last.endDate = current.endDate;
+    } else {
+      merged.push({ ...current });
+    }
+  }
+  return merged;
+}
 
 async function fetchHolidaysForRegion(endpoint, region, validFrom, validTo) {
   try {
@@ -323,13 +383,33 @@ async function refreshHolidayCache() {
     allPublicHolidays.push(...pub);
   }
 
+  // Alle 16 Bundesländer einzeln laden, NUR für die "Deutschland gesamt"-
+  // Vereinigung im neuen Ferienkalender-Tab - fließt NICHT in
+  // is_school_holiday/holiday_countries (Attraktions-Prognosen) ein, das
+  // bleibt bewusst bei NRW als repräsentativer Region für den Park.
+  const germanStatesRaw = [];
+  for (const state of GERMAN_STATE_CODES) {
+    const region = { country: 'DE', subdivision: state.code, label: state.name };
+    const school = await fetchHolidaysForRegion('SchoolHolidays', region, validFrom, validTo);
+    germanStatesRaw.push(...school);
+  }
+
+  // Zeiträume der 16 Bundesländer zu einer einzigen "Deutschland"-Zeile
+  // vereinigen (Union): sich überlappende/berührende Zeiträume werden zu
+  // einem durchgehenden Zeitraum zusammengeführt, damit die Deutschland-Zeile
+  // im Kalender nicht aus 16-fach übereinandergelegten Einzelbalken besteht,
+  // sondern eine klare "irgendwo in Deutschland sind Ferien"-Linie zeigt -
+  // exakt wie im gewünschten Referenzdesign (schulferien.org).
+  const germanUnion = mergeDateRanges(germanStatesRaw.map(h => ({ startDate: h.startDate, endDate: h.endDate })));
+
   holidayCache = {
     schoolHolidays: allSchoolHolidays,
     publicHolidays: allPublicHolidays,
+    germanUnion,
     lastFetched: Date.now()
   };
 
-  console.log(`-> ${allSchoolHolidays.length} Schulferien-Zeiträume, ${allPublicHolidays.length} Feiertage geladen.`);
+  console.log(`-> ${allSchoolHolidays.length} Schulferien-Zeiträume (NRW+Nachbarländer), ${allPublicHolidays.length} Feiertage, ${germanUnion.length} vereinigte Deutschland-Zeiträume (alle 16 Bundesländer) geladen.`);
 }
 
 function getSchoolHolidayInfo(dateStr) {
@@ -557,6 +637,45 @@ app.get('/api/context', async (req, res) => {
 
   } catch (err) {
     console.error('Fehler in /api/context:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- FERIENKALENDER-ÜBERSICHT (für den neuen "Ferien"-Tab) ----------
+// Liefert eine schlanke, für den Tabellen-Kalender optimierte Struktur:
+// pro "Zeile" (Deutschland gesamt + die 4 Nachbarländer) eine Liste von
+// Ferien-Zeiträumen (bereits vereinigt bei Deutschland) sowie eine separate
+// Liste aller Feiertage über alle Regionen. Bewusst getrennt von /api/context,
+// da dort die Attraktions-Prognosen NRW-spezifische Daten brauchen, während
+// der Kalender-Tab die vereinigte "irgendwo in Deutschland"-Sicht will.
+app.get('/api/holidays-overview', async (req, res) => {
+  try {
+    if (holidayCache.lastFetched === 0) {
+      await refreshHolidayCache();
+    }
+
+    // Feiertage aus allen Regionen sammeln, aber "Deutschland (NRW)" auf
+    // "Deutschland" umbenennen, damit die Zeilenbeschriftung zur
+    // zusammengefassten Ferien-Zeile passt (Feiertage wie der 3. Oktober
+    // gelten ohnehin bundesweit, NRW-Feiertage sind repräsentativ genug)
+    const publicHolidaysRenamed = holidayCache.publicHolidays.map(h => ({
+      ...h,
+      country: h.country === 'Deutschland (NRW)' ? 'Deutschland' : h.country
+    }));
+
+    res.json({
+      rows: [
+        { country: 'Deutschland', schoolHolidays: holidayCache.germanUnion },
+        { country: 'Niederlande', schoolHolidays: holidayCache.schoolHolidays.filter(h => h.country === 'Niederlande') },
+        { country: 'Belgien', schoolHolidays: holidayCache.schoolHolidays.filter(h => h.country === 'Belgien') },
+        { country: 'Frankreich', schoolHolidays: holidayCache.schoolHolidays.filter(h => h.country === 'Frankreich') },
+        { country: 'Luxemburg', schoolHolidays: holidayCache.schoolHolidays.filter(h => h.country === 'Luxemburg') }
+      ],
+      publicHolidays: publicHolidaysRenamed,
+      lastRefreshed: holidayCache.lastFetched ? new Date(holidayCache.lastFetched).toISOString() : null
+    });
+  } catch (err) {
+    console.error('Fehler in /api/holidays-overview:', err.message);
     res.status(500).json({ error: 'Serverfehler.' });
   }
 });
