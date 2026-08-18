@@ -38,9 +38,12 @@ const db = createClient({
   authToken: process.env.TURSO_AUTH_TOKEN,
 });
 
+// Ausschließlich Phantasialand - andere Parks wurden bewusst entfernt, da
+// diese App exklusiv für Phantasialand gebaut ist. Vorher liefen Kings
+// Island und Cedar Point unnötig im 5-Minuten-Speicherzyklus mit, obwohl sie
+// nirgends in der App genutzt wurden - das kostete bei jedem Zyklus unnötig
+// Zeit (2 zusätzliche externe API-Calls) und DB-Speicherplatz.
 const PARKS = [
-  { id: '60', name: 'Kings Island' },
-  { id: '64', name: 'Cedar Point' },
   { id: '56', name: 'Phantasialand' }
 ];
 
@@ -2315,18 +2318,24 @@ async function start() {
   try {
     await initDatabase();
 
-    // Einmaliger Reset des Prognose-Caches beim Start: die Ausfallerkennung
-    // wurde gerade korrigiert (30-Min-Puffer vor Parkschluss greift jetzt
-    // zuverlässig auch für historische Tage ohne bekannte Öffnungszeiten,
-    // siehe DEFAULT_CLOSE_TIME_FALLBACK). Alte, mit der fehlerhaften Logik
-    // berechnete Cache-Einträge (z.B. "19-20 Uhr = häufigste Ausfallzeit")
-    // würden sonst bis zu 15 Minuten oder bis zur nächsten Faktoränderung
-    // weiterhin ausgeliefert. Betrifft nur den Cache, nicht die Rohdaten.
+    // Einmalige Bereinigung: alte Wartezeiten-Daten von Kings Island (60) und
+    // Cedar Point (64) löschen - diese Parks wurden aus der App entfernt
+    // (sie liefen vorher unnötig im 5-Minuten-Speicherzyklus mit, obwohl
+    // nirgends in der App genutzt). Betrifft nur historische Altdaten dieser
+    // beiden Fremd-Parks, Phantasialand-Daten sind davon nicht betroffen.
+    // Idempotent: löscht bei jedem Start erneut, falls doch mal wieder was
+    // reinrutschen sollte, ist aber nach dem ersten Lauf ein No-Op.
     try {
-      await db.execute(`DELETE FROM forecast_cache`);
-      console.log('🔄 Prognose-Cache zurückgesetzt (korrigierte Ausfallerkennung).');
+      const cleanup = await db.execute(`DELETE FROM wait_times WHERE park_id IN ('60', '64')`);
+      if (cleanup.rowsAffected > 0) {
+        console.log(`🧹 ${cleanup.rowsAffected} alte Wartezeiten-Zeilen von entfernten Fremd-Parks gelöscht.`);
+      }
+      const cleanupHours = await db.execute(`DELETE FROM park_opening_hours WHERE park_id IN ('60', '64')`);
+      if (cleanupHours.rowsAffected > 0) {
+        console.log(`🧹 ${cleanupHours.rowsAffected} alte Öffnungszeiten-Zeilen von entfernten Fremd-Parks gelöscht.`);
+      }
     } catch (err) {
-      console.error('Konnte Prognose-Cache nicht zurücksetzen:', err.message);
+      console.error('Konnte alte Fremd-Park-Daten nicht bereinigen:', err.message);
     }
 
     await fetchAndSaveData();
