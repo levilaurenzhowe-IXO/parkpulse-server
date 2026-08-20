@@ -136,6 +136,24 @@ async function initDatabase() {
     )
   `);
 
+  // Speichert die Kartenkoordinaten (Latitude/Longitude) einzelner
+  // Attraktionen für die neue Karten-Ansicht (Leaflet + OpenStreetMap).
+  // Wird über die App selbst gepflegt (Klick auf die Karte setzt/verschiebt
+  // einen Marker), nicht über eine externe Quelle - daher eine eigene
+  // schlanke Tabelle statt eines zusätzlichen Feldes in wait_times (die
+  // Position einer Attraktion ändert sich praktisch nie, muss also nicht
+  // pro Messpunkt wiederholt gespeichert werden).
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS ride_coordinates (
+      park_id TEXT NOT NULL,
+      ride_name TEXT NOT NULL,
+      latitude REAL NOT NULL,
+      longitude REAL NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (park_id, ride_name)
+    )
+  `);
+
   console.log('✅ Datenbank-Schema bereit.');
 }
 
@@ -808,6 +826,223 @@ app.get('/api/rides-list', async (req, res) => {
     res.json({ rides: result.rows.map(r => r.ride_name) });
   } catch (err) {
     console.error('Fehler in /api/rides-list:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- KARTE: Koordinaten pflegen ----------
+// Setzt oder aktualisiert die Position einer Attraktion auf der Karte.
+// Wird von der neuen Klick-auf-Karte-Oberfläche im Frontend aufgerufen.
+app.post('/api/ride-coordinates', async (req, res) => {
+  const { parkId, rideName, latitude, longitude } = req.body;
+
+  if (!parkId || !rideName || latitude === undefined || longitude === undefined) {
+    return res.status(400).json({ error: 'parkId, rideName, latitude und longitude erforderlich.' });
+  }
+  if (typeof latitude !== 'number' || typeof longitude !== 'number' || isNaN(latitude) || isNaN(longitude)) {
+    return res.status(400).json({ error: 'latitude/longitude müssen gültige Zahlen sein.' });
+  }
+
+  try {
+    await db.execute({
+      sql: `INSERT INTO ride_coordinates (park_id, ride_name, latitude, longitude, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(park_id, ride_name) DO UPDATE SET latitude=excluded.latitude, longitude=excluded.longitude, updated_at=excluded.updated_at`,
+      args: [parkId, rideName, latitude, longitude, Date.now()]
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Fehler in /api/ride-coordinates (POST):', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// Entfernt die Koordinate einer Attraktion wieder (falls versehentlich
+// falsch gesetzt oder eine Attraktion umgezogen/entfernt wurde)
+app.delete('/api/ride-coordinates', async (req, res) => {
+  const { parkId, rideName } = req.body;
+  if (!parkId || !rideName) {
+    return res.status(400).json({ error: 'parkId und rideName erforderlich.' });
+  }
+  try {
+    await db.execute({
+      sql: `DELETE FROM ride_coordinates WHERE park_id = ? AND ride_name = ?`,
+      args: [parkId, rideName]
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Fehler in /api/ride-coordinates (DELETE):', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+app.get('/api/ride-coordinates', async (req, res) => {
+  const parkId = req.query.park || '56';
+  try {
+    const result = await db.execute({
+      sql: `SELECT ride_name, latitude, longitude FROM ride_coordinates WHERE park_id = ?`,
+      args: [parkId]
+    });
+    res.json({ coordinates: result.rows });
+  } catch (err) {
+    console.error('Fehler in /api/ride-coordinates (GET):', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- KARTE: Live-Daten kombiniert (Position + aktuelle Wartezeit) ----------
+// Liefert für jede Attraktion MIT gesetzter Koordinate die aktuelle
+// Wartezeit, damit das Frontend Marker/Heatmap in einem einzigen Aufruf
+// aufbauen kann, statt Koordinaten und Live-Wartezeiten separat zu holen und
+// clientseitig zusammenzuführen.
+app.get('/api/map-live', async (req, res) => {
+  const parkId = req.query.park || '56';
+
+  try {
+    const coordsResult = await db.execute({
+      sql: `SELECT ride_name, latitude, longitude FROM ride_coordinates WHERE park_id = ?`,
+      args: [parkId]
+    });
+    if (coordsResult.rows.length === 0) {
+      return res.json({ rides: [] });
+    }
+
+    const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+    const latestResult = await db.execute({
+      sql: `
+        SELECT ride_name, is_open, wait_time, recorded_at
+        FROM wait_times
+        WHERE park_id = ? AND recorded_date = ?
+        ORDER BY recorded_at DESC
+      `,
+      args: [parkId, today]
+    });
+
+    // Neuesten Messpunkt pro Attraktion herausfiltern (erste Zeile pro
+    // ride_name, da absteigend nach recorded_at sortiert wurde)
+    const latestByRide = {};
+    latestResult.rows.forEach(row => {
+      if (!latestByRide[row.ride_name]) latestByRide[row.ride_name] = row;
+    });
+
+    const rides = coordsResult.rows.map(coord => {
+      const live = latestByRide[coord.ride_name];
+      return {
+        name: coord.ride_name,
+        latitude: coord.latitude,
+        longitude: coord.longitude,
+        isOpen: live ? !!live.is_open : null,
+        waitTime: live ? live.wait_time : null,
+        hasLiveData: !!live
+      };
+    });
+
+    res.json({ rides });
+  } catch (err) {
+    console.error('Fehler in /api/map-live:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
+// ---------- KARTE: Publikumsstrom-Pfeile ----------
+// Nutzt die bereits vorhandene Korrelationslogik (siehe
+// /api/ride-correlations): zwei Attraktionen, deren Wartezeiten stark
+// GEGENLÄUFIG korrelieren (eine wird voll, während die andere leerer wird),
+// deuten darauf hin, dass sich Besucherströme zwischen diesen Bereichen
+// verschieben. Liefert für JEDE Attraktion mit Koordinate die stärkste
+// gegenläufige Verbindung zu einer anderen Attraktion MIT Koordinate, als
+// Basis für die Pfeil-Ebene auf der Karte. Bewusst nur die eine stärkste
+// Verbindung pro Attraktion, sonst würde die Karte mit Pfeilen überladen.
+app.get('/api/map-flow', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
+
+  try {
+    const coordsResult = await db.execute({
+      sql: `SELECT ride_name, latitude, longitude FROM ride_coordinates WHERE park_id = ?`,
+      args: [parkId]
+    });
+    if (coordsResult.rows.length < 2) {
+      return res.json({ flows: [] }); // braucht mindestens 2 Punkte für einen Pfeil
+    }
+    const coordByName = {};
+    coordsResult.rows.forEach(r => { coordByName[r.ride_name] = r; });
+    const namesWithCoords = coordsResult.rows.map(r => r.ride_name);
+
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    // Alle Wartezeiten der letzten N Tage für Attraktionen MIT Koordinate
+    // laden (ein einziger Query statt einer Schleife über /api/ride-correlations,
+    // da wir hier mehrere Attraktionen gleichzeitig gegeneinander vergleichen müssen)
+    const placeholders = namesWithCoords.map(() => '?').join(',');
+    const rowsResult = await db.execute({
+      sql: `
+        SELECT ride_name, recorded_at, wait_time
+        FROM wait_times
+        WHERE park_id = ? AND recorded_date >= ? AND is_open = 1 AND ride_name IN (${placeholders})
+      `,
+      args: [parkId, cutoffDate, ...namesWithCoords]
+    });
+
+    const byRide = {};
+    rowsResult.rows.forEach(row => {
+      if (!byRide[row.ride_name]) byRide[row.ride_name] = [];
+      byRide[row.ride_name].push(row);
+    });
+
+    // Ø-Wartezeit und eine Map recorded_at -> wait_time pro Attraktion vorbereiten
+    const rideStats = {};
+    Object.entries(byRide).forEach(([name, rows]) => {
+      if (rows.length < 10) return; // zu wenig Daten für eine verlässliche Aussage
+      const avg = rows.reduce((s, r) => s + r.wait_time, 0) / rows.length;
+      const map = new Map(rows.map(r => [r.recorded_at, r.wait_time]));
+      rideStats[name] = { avg, map, count: rows.length };
+    });
+
+    const validNames = Object.keys(rideStats);
+    const flows = [];
+
+    validNames.forEach(nameA => {
+      let strongestNegative = null; // stärkste GEGENLÄUFIGE Korrelation (Publikumsstrom-Indikator)
+
+      validNames.forEach(nameB => {
+        if (nameA === nameB) return;
+        const a = rideStats[nameA];
+        const b = rideStats[nameB];
+
+        let matchCount = 0, oppositeCount = 0, total = 0;
+        a.map.forEach((waitA, timestamp) => {
+          if (!b.map.has(timestamp)) return;
+          const waitB = b.map.get(timestamp);
+          const aAbove = waitA > a.avg;
+          const bAbove = waitB > b.avg;
+          if (aAbove !== bAbove) oppositeCount++; else matchCount++;
+          total++;
+        });
+        if (total < 10) return;
+
+        const oppositeScore = oppositeCount / total; // 0.5=keine Korrelation, 1.0=perfekt gegenläufig
+        if (oppositeScore > 0.65 && (!strongestNegative || oppositeScore > strongestNegative.score)) {
+          strongestNegative = { target: nameB, score: oppositeScore, sharedPoints: total };
+        }
+      });
+
+      if (strongestNegative) {
+        flows.push({
+          from: nameA,
+          to: strongestNegative.target,
+          fromCoord: coordByName[nameA],
+          toCoord: coordByName[strongestNegative.target],
+          strength: Math.round(strongestNegative.score * 100) / 100
+        });
+      }
+    });
+
+    res.json({ flows, basedOnDays: days });
+  } catch (err) {
+    console.error('Fehler in /api/map-flow:', err.message);
     res.status(500).json({ error: 'Serverfehler.' });
   }
 });
