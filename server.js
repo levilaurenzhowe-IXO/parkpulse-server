@@ -1047,6 +1047,99 @@ app.get('/api/map-flow', async (req, res) => {
   }
 });
 
+// ---------- KARTE: Zeit-Regler-Prognose ("Zeitreise") ----------
+// Liefert für ALLE Attraktionen mit gesetzter Koordinate die prognostizierte
+// Wartezeit zu einem gewählten Zukunfts-/Vergangenheits-Zeitpunkt (basierend
+// auf derselben intelligenten Ähnlichkeits-Prognose wie die grüne Linie im
+// Live-Tab, siehe computeSmartForecast()), PLUS die daraus abgeleiteten
+// Publikums-Ströme zwischen Themenbereichen für genau diesen Zeitpunkt.
+// targetTime: "HH:MM", z.B. "14:30" - wird vom Zeit-Regler im Frontend übergeben.
+app.get('/api/map-flow-at-time', async (req, res) => {
+  const parkId = req.query.park || '56';
+  const targetTime = req.query.time; // "HH:MM"
+
+  if (!targetTime || !/^\d{2}:\d{2}$/.test(targetTime)) {
+    return res.status(400).json({ error: 'time Parameter im Format HH:MM erforderlich.' });
+  }
+
+  try {
+    const coordsResult = await db.execute({
+      sql: `SELECT ride_name, latitude, longitude FROM ride_coordinates WHERE park_id = ?`,
+      args: [parkId]
+    });
+    if (coordsResult.rows.length === 0) {
+      return res.json({ rides: [] });
+    }
+
+    const now = new Date();
+    const nowMinutes = now.getHours() * 60 + now.getMinutes();
+    const [th, tm] = targetTime.split(':').map(Number);
+    const targetMinutes = th * 60 + tm;
+    const isPast = targetMinutes < nowMinutes - 5; // kleine Toleranz um "jetzt"
+
+    // Für Zeitpunkte in der VERGANGENHEIT (Regler nach links) reicht die
+    // Prognose-Engine nicht (die deckt nur die nächsten paar Stunden ab) -
+    // stattdessen wird der historische 30-Tage-Ø-Wert für exakt diesen
+    // Zeit-Slot herangezogen (dieselbe Datengrundlage wie die Durchschnitts-
+    // Kurve im Statistik-Tab), einheitlich für alle Attraktionen in einem
+    // einzigen Query statt einer Schleife.
+    let historicalByRide = {};
+    if (isPast) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - 30);
+      const cutoffDate = cutoff.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+      const names = coordsResult.rows.map(r => r.ride_name);
+      const placeholders = names.map(() => '?').join(',');
+      const histResult = await db.execute({
+        sql: `
+          SELECT ride_name, AVG(CASE WHEN is_open=1 THEN wait_time ELSE NULL END) as avg_wait
+          FROM wait_times
+          WHERE park_id = ? AND recorded_date >= ? AND recorded_time = ? AND ride_name IN (${placeholders})
+          GROUP BY ride_name
+        `,
+        args: [parkId, cutoffDate, targetTime, ...names]
+      });
+      histResult.rows.forEach(r => { historicalByRide[r.ride_name] = r.avg_wait; });
+    }
+
+    // Für Zeitpunkte in der GEGENWART/ZUKUNFT: intelligente Ähnlichkeits-
+    // Prognose nutzen (dieselbe wie die grüne Linie im Live-Tab), serverseitig
+    // bereits gecacht - wiederholte Regler-Bewegungen sind daher performant.
+    const ridesWithForecast = await Promise.all(
+      coordsResult.rows.map(async (coord) => {
+        if (isPast) {
+          const avg = historicalByRide[coord.ride_name];
+          return {
+            name: coord.ride_name,
+            latitude: coord.latitude,
+            longitude: coord.longitude,
+            forecastWait: avg !== undefined && avg !== null ? Math.round(avg) : null,
+            source: 'historical'
+          };
+        }
+        try {
+          const forecast = await computeSmartForecast(parkId, coord.ride_name);
+          const slot = (forecast.slots || []).find(s => s.time === targetTime);
+          return {
+            name: coord.ride_name,
+            latitude: coord.latitude,
+            longitude: coord.longitude,
+            forecastWait: slot ? slot.forecast : null,
+            source: 'forecast'
+          };
+        } catch (err) {
+          return { name: coord.ride_name, latitude: coord.latitude, longitude: coord.longitude, forecastWait: null, source: 'error' };
+        }
+      })
+    );
+
+    res.json({ rides: ridesWithForecast, targetTime, isPast });
+  } catch (err) {
+    console.error('Fehler in /api/map-flow-at-time:', err.message);
+    res.status(500).json({ error: 'Serverfehler.' });
+  }
+});
+
 app.get('/api/daily-stats', async (req, res) => {
   const parkId = req.query.park || '56';
   const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
