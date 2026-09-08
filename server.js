@@ -188,7 +188,7 @@ async function initDatabase() {
     )
   `);
 
-  await migrateOldSchemaIfNeeded();
+
 
   // ============================================================
   // KOMPATIBILITÄTS-VIEW: "wait_times_view" sieht für alle bestehenden
