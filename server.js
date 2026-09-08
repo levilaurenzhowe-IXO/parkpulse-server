@@ -56,38 +56,72 @@ let currentWeatherCache = null;
 let currentSchoolHolidayCache = null;
 
 async function initDatabase() {
+  // ============================================================
+  // SPEICHER-OPTIMIERTES SCHEMA (normalisiert statt redundant)
+  // ============================================================
+  // Vorher wurde in JEDER Zeile von wait_times (eine Zeile pro Attraktion
+  // PRO Messzyklus, alle 5 Minuten) der komplette Attraktionsname als Text
+  // UND Wetter/Ferien/Feiertags-Werte dupliziert - obwohl diese Werte für
+  // ALLE ~35 Attraktionen desselben Messzyklus identisch sind. Bei ~10.000
+  // Zeilen/Tag bedeutete das massive Redundanz. Die neue Struktur:
+  // - "rides": einmalige Zuordnung ride_name -> kompakte ride_id (INTEGER)
+  // - "weather_snapshots": EIN Eintrag pro Messzyklus (statt 35x dupliziert)
+  //   für Wetter/Ferien/Feiertag, referenziert per snapshot_id
+  // - "wait_times": nur noch die eigentlich variierenden Werte (ride_id,
+  //   is_open, wait_time) + Verweis auf recorded_at und snapshot_id
+  // recorded_date/recorded_time werden NICHT mehr gespeichert (waren
+  // redundant zu recorded_at, das als Unix-Timestamp bereits alles enthält
+  // und günstig aus JS ableitbar ist) - siehe timestampToDate()/
+  // timestampToTime() Hilfsfunktionen weiter unten.
+
   await db.execute(`
-    CREATE TABLE IF NOT EXISTS wait_times (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+    CREATE TABLE IF NOT EXISTS rides (
+      ride_id INTEGER PRIMARY KEY AUTOINCREMENT,
       park_id TEXT NOT NULL,
-      ride_id TEXT,
       ride_name TEXT NOT NULL,
-      is_open INTEGER NOT NULL,
-      wait_time INTEGER NOT NULL,
+      UNIQUE(park_id, ride_name)
+    )
+  `);
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS weather_snapshots (
+      snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      park_id TEXT NOT NULL,
       recorded_at INTEGER NOT NULL,
       recorded_date TEXT NOT NULL,
       recorded_time TEXT NOT NULL,
+      temperature REAL,
+      precipitation REAL,
+      weather_code INTEGER,
+      is_school_holiday INTEGER,
+      holiday_countries TEXT,
+      is_public_holiday INTEGER,
+      is_complete_snapshot INTEGER,
+      UNIQUE(park_id, recorded_at)
+    )
+  `);
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_weather_date ON weather_snapshots (park_id, recorded_date)`);
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS wait_times (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ride_id INTEGER NOT NULL,
+      snapshot_id INTEGER NOT NULL,
+      is_open INTEGER NOT NULL,
+      wait_time INTEGER NOT NULL,
+      recorded_at INTEGER NOT NULL,
       weekday INTEGER NOT NULL
     )
   `);
 
-  const newColumns = [
-    { name: 'temperature', type: 'REAL' },
-    { name: 'precipitation', type: 'REAL' },
-    { name: 'weather_code', type: 'INTEGER' },
-    { name: 'is_school_holiday', type: 'INTEGER' },
-    { name: 'holiday_countries', type: 'TEXT' },
-    { name: 'is_public_holiday', type: 'INTEGER' },
-    { name: 'is_complete_snapshot', type: 'INTEGER' } // 1 = mind. MIN_RIDES_FOR_CROWD_DATA Attraktionen wurden in diesem Messzyklus gefunden -> für Besucherzahlen-Grafen nutzbar
-  ];
-  for (const col of newColumns) {
-    try {
-      await db.execute(`ALTER TABLE wait_times ADD COLUMN ${col.name} ${col.type}`);
-    } catch (err) {}
-  }
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_wait_ride ON wait_times (ride_id, recorded_at)`);
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_wait_snapshot ON wait_times (snapshot_id)`);
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_weather_park_time ON weather_snapshots (park_id, recorded_at)`);
 
-  await db.execute(`CREATE INDEX IF NOT EXISTS idx_park_date ON wait_times (park_id, recorded_date)`);
-  await db.execute(`CREATE INDEX IF NOT EXISTS idx_ride_name ON wait_times (park_id, ride_name)`);
+  // Alte Roh-Spalten aus einer evtl. bereits existierenden wait_times-Tabelle
+  // (vor der Normalisierung) werden NICHT mehr automatisch per ALTER TABLE
+  // ergänzt - die Migration der Altdaten übernimmt migrateOldSchemaIfNeeded()
+  // beim Start (siehe unten), danach ist das alte, redundante Schema obsolet.
 
   await db.execute(`
     CREATE TABLE IF NOT EXISTS hidden_rides (
@@ -154,7 +188,193 @@ async function initDatabase() {
     )
   `);
 
+  await migrateOldSchemaIfNeeded();
+
+  // ============================================================
+  // KOMPATIBILITÄTS-VIEW: "wait_times_view" sieht für alle bestehenden
+  // SQL-Abfragen im restlichen Code GENAUSO aus wie die alte, redundante
+  // wait_times-Tabelle (gleiche Spaltennamen: ride_name, park_id,
+  // recorded_date, recorded_time, temperature, etc.) - ist aber real aus
+  // den drei schlanken, normalisierten Tabellen (wait_times, rides,
+  // weather_snapshots) zusammengesetzt. Dadurch mussten die ~40 bestehenden
+  // Endpoints, die zuvor "FROM wait_times_view ..." nutzten, nur auf
+  // "FROM wait_times_view ..." umgestellt werden, OHNE ihre sonstige
+  // SQL-Logik (WHERE/GROUP BY/etc.) anfassen zu müssen - das Risiko, beim
+  // Umbau von 40 Stellen Fehler einzubauen, wäre sonst erheblich gewesen.
+  // recorded_date/recorded_time werden hier aus recorded_at (Unix-Timestamp
+  // in Millisekunden) on-the-fly berechnet, kosten also keinen zusätzlichen
+  // Speicherplatz in der eigentlichen wait_times-Tabelle.
+  await db.execute(`DROP VIEW IF EXISTS wait_times_view`);
+  await db.execute(`
+    CREATE VIEW wait_times_view AS
+    SELECT
+      w.id AS id,
+      r.park_id AS park_id,
+      CAST(w.ride_id AS TEXT) AS ride_id,
+      r.ride_name AS ride_name,
+      w.is_open AS is_open,
+      w.wait_time AS wait_time,
+      w.recorded_at AS recorded_at,
+      ws.recorded_date AS recorded_date,
+      ws.recorded_time AS recorded_time,
+      w.weekday AS weekday,
+      ws.temperature AS temperature,
+      ws.precipitation AS precipitation,
+      ws.weather_code AS weather_code,
+      ws.is_school_holiday AS is_school_holiday,
+      ws.holiday_countries AS holiday_countries,
+      ws.is_public_holiday AS is_public_holiday,
+      ws.is_complete_snapshot AS is_complete_snapshot
+    FROM wait_times w
+    JOIN rides r ON r.ride_id = w.ride_id
+    JOIN weather_snapshots ws ON ws.snapshot_id = w.snapshot_id
+  `);
+
   console.log('✅ Datenbank-Schema bereit.');
+}
+
+// ---------- MIGRATION: altes redundantes Schema -> neues normalisiertes Schema ----------
+// Prüft, ob noch eine ALTE wait_times-Tabelle mit den ursprünglichen
+// redundanten Spalten (ride_name TEXT, recorded_date, temperature, etc.
+// direkt in wait_times) existiert, und überführt deren Daten EINMALIG in die
+// neue normalisierte Struktur (rides + weather_snapshots + schlanke
+// wait_times). Läuft nur, wenn tatsächlich Alt-Daten gefunden werden -
+// bei einer bereits migrierten oder ganz frischen Datenbank ist das ein No-Op.
+async function migrateOldSchemaIfNeeded() {
+  try {
+    // Prüfen, ob die alte Spalte "ride_name" noch direkt in wait_times
+    // existiert (Kennzeichen für das alte, unmigrerte Schema)
+    const cols = await db.execute(`PRAGMA table_info(wait_times)`);
+    const hasOldRideName = cols.rows.some(c => c.name === 'ride_name');
+    if (!hasOldRideName) return; // schon migriert oder frische DB, nichts zu tun
+
+    console.log('🔄 Migriere altes Datenbankschema auf normalisierte Struktur (das kann je nach Datenmenge etwas dauern)...');
+
+    // 1) Alte Tabelle umbenennen, damit eine frische wait_times mit neuem
+    // Schema angelegt werden kann, ohne die Altdaten zu verlieren
+    await db.execute(`ALTER TABLE wait_times RENAME TO wait_times_old`);
+
+    await db.execute(`
+      CREATE TABLE wait_times (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ride_id INTEGER NOT NULL,
+        snapshot_id INTEGER NOT NULL,
+        is_open INTEGER NOT NULL,
+        wait_time INTEGER NOT NULL,
+        recorded_at INTEGER NOT NULL,
+        weekday INTEGER NOT NULL
+      )
+    `);
+    await db.execute(`CREATE INDEX IF NOT EXISTS idx_wait_ride ON wait_times (ride_id, recorded_at)`);
+    await db.execute(`CREATE INDEX IF NOT EXISTS idx_wait_snapshot ON wait_times (snapshot_id)`);
+
+    // 2) Alle unterschiedlichen Attraktionsnamen einmalig in "rides" anlegen
+    const oldRideNames = await db.execute(`SELECT DISTINCT park_id, ride_name FROM wait_times_old`);
+    for (const row of oldRideNames.rows) {
+      await db.execute({
+        sql: `INSERT OR IGNORE INTO rides (park_id, ride_name) VALUES (?, ?)`,
+        args: [row.park_id, row.ride_name]
+      });
+    }
+    const rideIdMap = {}; // "park_id|ride_name" -> ride_id
+    const allRides = await db.execute(`SELECT ride_id, park_id, ride_name FROM rides`);
+    allRides.rows.forEach(r => { rideIdMap[`${r.park_id}|${r.ride_name}`] = r.ride_id; });
+
+    // 3) Alle unterschiedlichen (park_id, recorded_at)-Kombinationen als EIN
+    // Wetter-Snapshot anlegen (statt 35x dupliziert wie vorher), inklusive
+    // der alten recorded_date/recorded_time-Werte (jetzt hier statt in
+    // wait_times gespeichert, da für alle Attraktionen desselben Zyklus identisch)
+    const oldSnapshots = await db.execute(`
+      SELECT DISTINCT park_id, recorded_at, recorded_date, recorded_time, temperature, precipitation, weather_code,
+             is_school_holiday, holiday_countries, is_public_holiday, is_complete_snapshot
+      FROM wait_times_old
+    `);
+    const snapshotIdMap = {}; // "park_id|recorded_at" -> snapshot_id
+    for (const row of oldSnapshots.rows) {
+      const result = await db.execute({
+        sql: `INSERT OR IGNORE INTO weather_snapshots
+              (park_id, recorded_at, recorded_date, recorded_time, temperature, precipitation, weather_code, is_school_holiday, holiday_countries, is_public_holiday, is_complete_snapshot)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [row.park_id, row.recorded_at, row.recorded_date, row.recorded_time, row.temperature, row.precipitation, row.weather_code, row.is_school_holiday, row.holiday_countries, row.is_public_holiday, row.is_complete_snapshot]
+      });
+    }
+    const allSnapshots = await db.execute(`SELECT snapshot_id, park_id, recorded_at FROM weather_snapshots`);
+    allSnapshots.rows.forEach(s => { snapshotIdMap[`${s.park_id}|${s.recorded_at}`] = s.snapshot_id; });
+
+    // 4) Alle alten wait_times-Zeilen in Batches ins neue schlanke Schema
+    // übertragen (Batches, um bei sehr vielen Altzeilen den Speicher- und
+    // Zeitbedarf des Migrationslaufs selbst überschaubar zu halten)
+    const BATCH_SIZE = 500;
+    let offset = 0;
+    let totalMigrated = 0;
+    while (true) {
+      const batch = await db.execute({
+        sql: `SELECT park_id, ride_name, is_open, wait_time, recorded_at, weekday FROM wait_times_old ORDER BY id ASC LIMIT ? OFFSET ?`,
+        args: [BATCH_SIZE, offset]
+      });
+      if (batch.rows.length === 0) break;
+
+      const statements = batch.rows.map(row => {
+        const rideId = rideIdMap[`${row.park_id}|${row.ride_name}`];
+        const snapshotId = snapshotIdMap[`${row.park_id}|${row.recorded_at}`];
+        return {
+          sql: `INSERT INTO wait_times (ride_id, snapshot_id, is_open, wait_time, recorded_at, weekday) VALUES (?, ?, ?, ?, ?, ?)`,
+          args: [rideId, snapshotId, row.is_open, row.wait_time, row.recorded_at, row.weekday]
+        };
+      }).filter(s => s.args[0] !== undefined && s.args[1] !== undefined); // Sicherheitsnetz gegen fehlende Zuordnungen
+
+      if (statements.length > 0) await db.batch(statements, 'write');
+      totalMigrated += batch.rows.length;
+      offset += BATCH_SIZE;
+    }
+
+    // 5) Alte Tabelle löschen, um den Speicherplatz tatsächlich freizugeben
+    await db.execute(`DROP TABLE wait_times_old`);
+
+    console.log(`✅ Migration abgeschlossen: ${totalMigrated} Wartezeit-Einträge, ${allRides.rows.length} Attraktionen, ${allSnapshots.rows.length} Wetter-Snapshots.`);
+  } catch (err) {
+    console.error('❌ Fehler bei der Schema-Migration:', err.message);
+    // Bewusst NICHT den Server-Start blockieren - falls die Migration aus
+    // irgendeinem Grund fehlschlägt, soll die App trotzdem mit dem
+    // bestehenden Stand weiterlaufen können, statt komplett auszufallen
+  }
+}
+
+// ---------- Hilfsfunktionen: recorded_at (Timestamp) -> Datum/Uhrzeit ----------
+// Ersetzen die früher redundant gespeicherten recorded_date/recorded_time
+// Textspalten - werden bei Bedarf aus dem ohnehin gespeicherten
+// recorded_at-Timestamp abgeleitet, kosten dafür keinen zusätzlichen Speicherplatz.
+function timestampToDate(ts) {
+  return new Date(ts).toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+}
+function timestampToTime(ts) {
+  return new Date(ts).toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' });
+}
+
+// ---------- Ride-ID-Cache (park_id+ride_name -> ride_id), um bei jedem
+// Speichervorgang nicht ständig dieselben Lookups erneut in die DB zu schicken
+let rideIdCache = {}; // "park_id|ride_name" -> ride_id
+
+async function getOrCreateRideId(parkId, rideName) {
+  const key = `${parkId}|${rideName}`;
+  if (rideIdCache[key] !== undefined) return rideIdCache[key];
+
+  const existing = await db.execute({
+    sql: `SELECT ride_id FROM rides WHERE park_id = ? AND ride_name = ?`,
+    args: [parkId, rideName]
+  });
+  if (existing.rows.length > 0) {
+    rideIdCache[key] = existing.rows[0].ride_id;
+    return rideIdCache[key];
+  }
+
+  const inserted = await db.execute({
+    sql: `INSERT INTO rides (park_id, ride_name) VALUES (?, ?)`,
+    args: [parkId, rideName]
+  });
+  const newId = Number(inserted.lastInsertRowid);
+  rideIdCache[key] = newId;
+  return newId;
 }
 
 async function fetchCurrentWeather() {
@@ -460,6 +680,7 @@ async function fetchAndSaveData() {
   currentWeatherCache = await fetchCurrentWeather();
 
   const now = new Date();
+  const recordedAt = Date.now();
   const recordedDate = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
   const recordedTime = now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' });
   const weekday = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).getDay();
@@ -497,21 +718,19 @@ async function fetchAndSaveData() {
       const MIN_RIDES_FOR_CROWD_DATA = 32;
       const isCompleteSnapshot = rides.length >= MIN_RIDES_FOR_CROWD_DATA ? 1 : 0;
 
-      const statements = rides.map(r => ({
-        sql: `INSERT INTO wait_times
-              (park_id, ride_id, ride_name, is_open, wait_time, recorded_at, recorded_date, recorded_time, weekday,
-               temperature, precipitation, weather_code, is_school_holiday, holiday_countries, is_public_holiday, is_complete_snapshot)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      // 1) EINEN Wetter-/Ferien-Snapshot für DIESEN Messzyklus anlegen -
+      // statt wie vorher denselben Wetter/Ferien-Datensatz für JEDE einzelne
+      // Attraktion separat zu duplizieren (bei ~35 Attraktionen war das die
+      // größte Speicherplatz-Verschwendung im alten Schema).
+      const snapshotResult = await db.execute({
+        sql: `INSERT INTO weather_snapshots
+              (park_id, recorded_at, recorded_date, recorded_time, temperature, precipitation, weather_code, is_school_holiday, holiday_countries, is_public_holiday, is_complete_snapshot)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           park.id,
-          String(r.id || ''),
-          r.name,
-          r.is_open ? 1 : 0,
-          r.wait_time || 0,
-          Date.now(),
+          recordedAt,
           recordedDate,
           recordedTime,
-          weekday,
           currentWeatherCache ? currentWeatherCache.temperature : null,
           currentWeatherCache ? currentWeatherCache.precipitation : null,
           currentWeatherCache ? currentWeatherCache.weatherCode : null,
@@ -520,7 +739,20 @@ async function fetchAndSaveData() {
           publicHolidayInfo.isHoliday ? 1 : 0,
           isCompleteSnapshot
         ]
-      }));
+      });
+      const snapshotId = Number(snapshotResult.lastInsertRowid);
+
+      // 2) Für jede Attraktion die kompakte ride_id auflösen (gecacht, siehe
+      // getOrCreateRideId - erzeugt bei neuen Attraktionsnamen automatisch
+      // einen neuen Eintrag in "rides") und die schlanke wait_times-Zeile speichern
+      const statements = [];
+      for (const r of rides) {
+        const rideId = await getOrCreateRideId(park.id, r.name);
+        statements.push({
+          sql: `INSERT INTO wait_times (ride_id, snapshot_id, is_open, wait_time, recorded_at, weekday) VALUES (?, ?, ?, ?, ?, ?)`,
+          args: [rideId, snapshotId, r.is_open ? 1 : 0, r.wait_time || 0, recordedAt, weekday]
+        });
+      }
 
       if (statements.length > 0) {
         await db.batch(statements, 'write');
@@ -716,7 +948,7 @@ app.get('/api/park', async (req, res) => {
     const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
 
     const result = await db.execute({
-      sql: `SELECT * FROM wait_times WHERE park_id = ? AND recorded_date = ? ORDER BY recorded_at ASC`,
+      sql: `SELECT * FROM wait_times_view WHERE park_id = ? AND recorded_date = ? ORDER BY recorded_at ASC`,
       args: [parkId, today]
     });
 
@@ -793,7 +1025,7 @@ app.get('/api/stats', async (req, res) => {
         CAST(substr(recorded_time, 1, 2) AS INTEGER) as hour,
         AVG(wait_time) as avg_wait,
         COUNT(*) as sample_count
-      FROM wait_times
+      FROM wait_times_view
       WHERE park_id = ? AND is_open = 1
     `;
     const args = [parkId];
@@ -820,7 +1052,7 @@ app.get('/api/rides-list', async (req, res) => {
 
   try {
     const result = await db.execute({
-      sql: `SELECT DISTINCT ride_name FROM wait_times WHERE park_id = ? ORDER BY ride_name ASC`,
+      sql: `SELECT DISTINCT ride_name FROM wait_times_view WHERE park_id = ? ORDER BY ride_name ASC`,
       args: [parkId]
     });
     res.json({ rides: result.rows.map(r => r.ride_name) });
@@ -911,7 +1143,7 @@ app.get('/api/map-live', async (req, res) => {
     const latestResult = await db.execute({
       sql: `
         SELECT ride_name, is_open, wait_time, recorded_at
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND recorded_date = ?
         ORDER BY recorded_at DESC
       `,
@@ -980,7 +1212,7 @@ app.get('/api/map-flow', async (req, res) => {
     const rowsResult = await db.execute({
       sql: `
         SELECT ride_name, recorded_at, wait_time
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND recorded_date >= ? AND is_open = 1 AND ride_name IN (${placeholders})
       `,
       args: [parkId, cutoffDate, ...namesWithCoords]
@@ -1093,7 +1325,7 @@ app.get('/api/map-flow-at-time', async (req, res) => {
       const histResult = await db.execute({
         sql: `
           SELECT ride_name, AVG(CASE WHEN is_open=1 THEN wait_time ELSE NULL END) as avg_wait
-          FROM wait_times
+          FROM wait_times_view
           WHERE park_id = ? AND recorded_date >= ? AND recorded_time = ? AND ride_name IN (${placeholders})
           GROUP BY ride_name
         `,
@@ -1156,7 +1388,7 @@ app.get('/api/daily-stats', async (req, res) => {
           AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
           COUNT(DISTINCT recorded_at) as sample_points,
           MAX(CASE WHEN is_open = 1 THEN wait_time ELSE 0 END) as peak_wait
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND recorded_date >= ?
         GROUP BY recorded_date
         ORDER BY recorded_date ASC
@@ -1171,7 +1403,7 @@ app.get('/api/daily-stats', async (req, res) => {
           ride_name,
           AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
           MAX(CASE WHEN is_open = 1 THEN wait_time ELSE 0 END) as peak_wait
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND recorded_date >= ?
         GROUP BY recorded_date, ride_name
         ORDER BY recorded_date ASC, ride_name ASC
@@ -1185,7 +1417,7 @@ app.get('/api/daily-stats', async (req, res) => {
           recorded_time,
           AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
           COUNT(DISTINCT recorded_date) as days_counted
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND recorded_date >= ?
         GROUP BY recorded_time
         ORDER BY recorded_time ASC
@@ -1199,7 +1431,7 @@ app.get('/api/daily-stats', async (req, res) => {
           recorded_time,
           ride_name,
           AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND recorded_date >= ?
         GROUP BY recorded_time, ride_name
         ORDER BY recorded_time ASC, ride_name ASC
@@ -1230,7 +1462,7 @@ app.get('/api/ride-days', async (req, res) => {
 
   try {
     const result = await db.execute({
-      sql: `SELECT DISTINCT recorded_date FROM wait_times WHERE park_id = ? AND ride_name = ? ORDER BY recorded_date ASC`,
+      sql: `SELECT DISTINCT recorded_date FROM wait_times_view WHERE park_id = ? AND ride_name = ? ORDER BY recorded_date ASC`,
       args: [parkId, rideName]
     });
     res.json({ days: result.rows.map(r => r.recorded_date) });
@@ -1249,7 +1481,7 @@ app.get('/api/crowd-days', async (req, res) => {
 
   try {
     const result = await db.execute({
-      sql: `SELECT DISTINCT recorded_date FROM wait_times WHERE park_id = ? AND is_complete_snapshot = 1 ORDER BY recorded_date ASC`,
+      sql: `SELECT DISTINCT recorded_date FROM wait_times_view WHERE park_id = ? AND is_complete_snapshot = 1 ORDER BY recorded_date ASC`,
       args: [parkId]
     });
     res.json({ days: result.rows.map(r => r.recorded_date) });
@@ -1278,7 +1510,7 @@ app.get('/api/crowd-history', async (req, res) => {
       const result = await db.execute({
         sql: `
           SELECT recorded_time, recorded_at, ride_name, is_open, wait_time
-          FROM wait_times
+          FROM wait_times_view
           WHERE park_id = ? AND recorded_date = ? AND is_complete_snapshot = 1
           ORDER BY recorded_at ASC
         `,
@@ -1310,7 +1542,7 @@ app.get('/api/crowd-history', async (req, res) => {
             ride_name,
             AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
             COUNT(DISTINCT recorded_date) as days_counted
-          FROM wait_times
+          FROM wait_times_view
           WHERE park_id = ? AND recorded_date >= ? AND is_complete_snapshot = 1
           GROUP BY recorded_time, ride_name
           ORDER BY recorded_time ASC, ride_name ASC
@@ -1353,7 +1585,7 @@ app.get('/api/ride-history', async (req, res) => {
       const result = await db.execute({
         sql: `
           SELECT recorded_time, is_open, wait_time
-          FROM wait_times
+          FROM wait_times_view
           WHERE park_id = ? AND ride_name = ? AND recorded_date = ?
           ORDER BY recorded_at ASC
         `,
@@ -1377,7 +1609,7 @@ app.get('/api/ride-history', async (req, res) => {
             recorded_time,
             AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
             COUNT(CASE WHEN is_open = 1 THEN 1 ELSE NULL END) as sample_count
-          FROM wait_times
+          FROM wait_times_view
           WHERE park_id = ? AND ride_name = ? AND recorded_date >= ?
           GROUP BY recorded_time
           ORDER BY recorded_time ASC
@@ -1449,7 +1681,7 @@ app.get('/api/weekday-stats', async (req, res) => {
           weekday,
           AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
           COUNT(DISTINCT recorded_date) as days_counted
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND recorded_date >= ?
         GROUP BY weekday
         ORDER BY weekday ASC
@@ -1491,7 +1723,7 @@ app.get('/api/weather-correlation', async (req, res) => {
         AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
         COUNT(DISTINCT recorded_date) as days_counted,
         AVG(temperature) as avg_temperature
-      FROM wait_times
+      FROM wait_times_view
       WHERE park_id = ? AND recorded_date >= ? AND weather_code IS NOT NULL
     `;
     const args = [parkId, cutoffDate];
@@ -1534,7 +1766,7 @@ app.get('/api/holiday-correlation', async (req, res) => {
           is_public_holiday,
           AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
           COUNT(DISTINCT recorded_date) as days_counted
-        FROM wait_times
+        FROM wait_times_view
         ${baseWhere}
         GROUP BY is_school_holiday, is_public_holiday
       `,
@@ -1566,7 +1798,7 @@ app.get('/api/ride-correlations', async (req, res) => {
     const targetResult = await db.execute({
       sql: `
         SELECT recorded_at, wait_time
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND recorded_date >= ? AND is_open = 1
       `,
       args: [parkId, rideName, cutoffDate]
@@ -1582,7 +1814,7 @@ app.get('/api/ride-correlations', async (req, res) => {
     const othersResult = await db.execute({
       sql: `
         SELECT ride_name, recorded_at, wait_time
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name != ? AND recorded_date >= ? AND is_open = 1
       `,
       args: [parkId, rideName, cutoffDate]
@@ -1650,7 +1882,7 @@ app.get('/api/smart-forecast', async (req, res) => {
     const baseResult = await db.execute({
       sql: `
         SELECT AVG(wait_time) as avg_wait, COUNT(*) as sample_count
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND weekday = ?
           AND CAST(substr(recorded_time, 1, 2) AS INTEGER) = ?
           AND is_open = 1
@@ -1662,7 +1894,7 @@ app.get('/api/smart-forecast', async (req, res) => {
     const holidayResult = await db.execute({
       sql: `
         SELECT is_school_holiday, AVG(wait_time) as avg_wait
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND is_open = 1 AND is_school_holiday IS NOT NULL
         GROUP BY is_school_holiday
       `,
@@ -1686,7 +1918,7 @@ app.get('/api/smart-forecast', async (req, res) => {
           SELECT
             CASE WHEN weather_code BETWEEN 51 AND 82 THEN 1 ELSE 0 END as is_rainy,
             AVG(wait_time) as avg_wait
-          FROM wait_times
+          FROM wait_times_view
           WHERE park_id = ? AND ride_name = ? AND is_open = 1 AND weather_code IS NOT NULL
           GROUP BY is_rainy
         `,
@@ -1761,7 +1993,7 @@ app.get('/api/day-forecast', async (req, res) => {
           recorded_time,
           AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
           COUNT(CASE WHEN is_open = 1 THEN 1 ELSE NULL END) as sample_count
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND recorded_date >= ? AND weekday = ?
         GROUP BY recorded_time
         ORDER BY recorded_time ASC
@@ -1777,7 +2009,7 @@ app.get('/api/day-forecast', async (req, res) => {
           recorded_time,
           AVG(CASE WHEN is_open = 1 THEN wait_time ELSE NULL END) as avg_wait,
           COUNT(CASE WHEN is_open = 1 THEN 1 ELSE NULL END) as sample_count
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND recorded_date >= ?
         GROUP BY recorded_time
         ORDER BY recorded_time ASC
@@ -1797,7 +2029,7 @@ app.get('/api/day-forecast', async (req, res) => {
     const holidayResult = await db.execute({
       sql: `
         SELECT is_school_holiday, AVG(wait_time) as avg_wait
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND is_open = 1 AND is_school_holiday IS NOT NULL
         GROUP BY is_school_holiday
       `,
@@ -1822,7 +2054,7 @@ app.get('/api/day-forecast', async (req, res) => {
           SELECT
             CASE WHEN weather_code BETWEEN 51 AND 82 THEN 1 ELSE 0 END as is_rainy,
             AVG(wait_time) as avg_wait
-          FROM wait_times
+          FROM wait_times_view
           WHERE park_id = ? AND ride_name = ? AND is_open = 1 AND weather_code IS NOT NULL
           GROUP BY is_rainy
         `,
@@ -2003,7 +2235,7 @@ app.get('/api/ride-outages', async (req, res) => {
     const result = await db.execute({
       sql: `
         SELECT recorded_time, recorded_at, is_open
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND recorded_date = ?
         ORDER BY recorded_at ASC
       `,
@@ -2057,7 +2289,7 @@ app.get('/api/ride-reliability', async (req, res) => {
     const result = await db.execute({
       sql: `
         SELECT recorded_date, recorded_time, recorded_at, is_open
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND recorded_date >= ?
         ORDER BY recorded_date ASC, recorded_at ASC
       `,
@@ -2170,7 +2402,7 @@ app.get('/api/rain-periods', async (req, res) => {
     const result = await db.execute({
       sql: `
         SELECT recorded_time, recorded_at, weather_code
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND recorded_date = ? AND weather_code IS NOT NULL
         GROUP BY recorded_time
         ORDER BY recorded_at ASC
@@ -2332,7 +2564,7 @@ async function findSimilarDays(parkId, rideName, todayProfile, daysLookback) {
   let sql = `
     SELECT recorded_date, weekday, is_open, wait_time, weather_code, temperature,
            is_school_holiday, holiday_countries, is_public_holiday
-    FROM wait_times
+    FROM wait_times_view
     WHERE park_id = ? AND ride_name = ?
   `;
   const args = [parkId, rideName];
@@ -2413,7 +2645,7 @@ async function computeSmartForecast(parkId, rideName) {
   const today = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
   const todayRowsResult = await db.execute({
     sql: `SELECT is_open, wait_time, weather_code, temperature, is_school_holiday, holiday_countries, is_public_holiday
-          FROM wait_times WHERE park_id = ? AND recorded_date = ?`,
+          FROM wait_times_view WHERE park_id = ? AND recorded_date = ?`,
     args: [parkId, today]
   });
   const weekday = now.getDay();
@@ -2442,7 +2674,7 @@ async function computeSmartForecast(parkId, rideName) {
     const fallbackResult = await db.execute({
       sql: `
         SELECT recorded_time, AVG(CASE WHEN is_open=1 THEN wait_time ELSE NULL END) as avg_wait, COUNT(*) as n
-        FROM wait_times
+        FROM wait_times_view
         WHERE park_id = ? AND ride_name = ? AND weekday = ? AND recorded_date >= ?
         GROUP BY recorded_time ORDER BY recorded_time ASC
       `,
@@ -2470,7 +2702,7 @@ async function computeSmartForecast(parkId, rideName) {
   const detailResult = await db.execute({
     sql: `
       SELECT recorded_date, recorded_time, is_open, wait_time
-      FROM wait_times
+      FROM wait_times_view
       WHERE park_id = ? AND ride_name = ? AND recorded_date IN (${placeholders})
     `,
     args: [parkId, rideName, ...similarDates]
@@ -2557,7 +2789,7 @@ async function computeRiskWindows(parkId, rideName, similarDates) {
   const rowsResult = await db.execute({
     sql: `
       SELECT recorded_date, recorded_time, recorded_at, is_open
-      FROM wait_times
+      FROM wait_times_view
       WHERE park_id = ? AND ride_name = ? AND recorded_date IN (${placeholders})
       ORDER BY recorded_date ASC, recorded_at ASC
     `,
@@ -2654,9 +2886,21 @@ async function start() {
     // Idempotent: löscht bei jedem Start erneut, falls doch mal wieder was
     // reinrutschen sollte, ist aber nach dem ersten Lauf ein No-Op.
     try {
-      const cleanup = await db.execute(`DELETE FROM wait_times WHERE park_id IN ('60', '64')`);
-      if (cleanup.rowsAffected > 0) {
-        console.log(`🧹 ${cleanup.rowsAffected} alte Wartezeiten-Zeilen von entfernten Fremd-Parks gelöscht.`);
+      // park_id existiert im neuen normalisierten Schema nicht mehr direkt
+      // in wait_times (nur noch über die "rides"-Tabelle referenziert) -
+      // daher zuerst die betroffenen ride_ids ermitteln, dann darüber löschen.
+      const foreignRideIds = await db.execute(`SELECT ride_id FROM rides WHERE park_id IN ('60', '64')`);
+      if (foreignRideIds.rows.length > 0) {
+        const idList = foreignRideIds.rows.map(r => r.ride_id).join(',');
+        const cleanup = await db.execute(`DELETE FROM wait_times WHERE ride_id IN (${idList})`);
+        if (cleanup.rowsAffected > 0) {
+          console.log(`🧹 ${cleanup.rowsAffected} alte Wartezeiten-Zeilen von entfernten Fremd-Parks gelöscht.`);
+        }
+        await db.execute(`DELETE FROM rides WHERE park_id IN ('60', '64')`);
+      }
+      const cleanupSnapshots = await db.execute(`DELETE FROM weather_snapshots WHERE park_id IN ('60', '64')`);
+      if (cleanupSnapshots.rowsAffected > 0) {
+        console.log(`🧹 ${cleanupSnapshots.rowsAffected} alte Wetter-Snapshots von entfernten Fremd-Parks gelöscht.`);
       }
       const cleanupHours = await db.execute(`DELETE FROM park_opening_hours WHERE park_id IN ('60', '64')`);
       if (cleanupHours.rowsAffected > 0) {
