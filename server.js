@@ -397,24 +397,87 @@ async function fetchCurrentWeather() {
   }
 }
 
-// ---------- ÖFFNUNGSZEITEN (von wartezeiten.app gescraped) ----------
-// wartezeiten.app hat kein öffentliches JSON-API für Öffnungszeiten, daher
-// wird die Live-Seite geladen und der Text "Von HH:MM bis HH:MM Uhr geöffnet"
-// per Regex extrahiert. Das ist bewusst FEHLERTOLERANT aufgebaut, mit drei
-// Stufen (siehe fetchParkOpeningHours):
-//   1. Erfolgreich gescraped -> source='scraped', wird in der DB gespeichert
-//   2. Scraping schlägt fehl, aber es gibt für HEUTE bereits einen früheren
-//      erfolgreichen Scrape -> dieser wird weiterverwendet, source='stale'
-//   3. Scraping schlägt fehl UND es gibt noch keinen erfolgreichen Scrape für
-//      heute -> harter Notfall-Fallback 09:00-19:00 Uhr, source='fallback'
-// In JEDEM Fall (auch bei Erfolg) wird zusätzlich global vermerkt, ob der
-// letzte Scrape-VERSUCH geklappt hat (lastOpeningHoursScrapeError) - das
-// Frontend zeigt dem Nutzer eine Warnung, wenn der Scraper zuletzt fehlschlug,
-// auch wenn dank Fallback weiterhin Öffnungszeiten angezeigt werden.
+// ---------- ÖFFNUNGSZEITEN ----------
+// PRIMÄRE QUELLE: ThemeParks.wiki API (https://api.themeparks.wiki/v1) - eine
+// kostenlose, öffentliche, offen dokumentierte JSON-API ohne Bot-Schutz, die
+// Öffnungszeiten für hunderte Parks bereitstellt, inkl. Phantasialand. Läuft
+// bevorzugt, weil sie stabil erreichbar ist und kein HTML-Scraping braucht.
+// FALLBACK: wartezeiten.app-Scraping bleibt als zweite Quelle bestehen, für
+// den Fall dass ThemeParks.wiki mal nicht erreichbar ist oder Phantasialand
+// dort vorübergehend fehlt - erst wenn BEIDE Quellen fehlschlagen, greift der
+// alte dreistufige Fallback (stale/harter Notfall).
+const THEMEPARKS_WIKI_BASE = 'https://api.themeparks.wiki/v1';
 const WARTEZEITEN_APP_URL = 'https://www.wartezeiten.app/phantasialand/';
 const OPENING_HOURS_FALLBACK = { openTime: '09:00', closeTime: '19:00' };
-let lastOpeningHoursScrapeError = null; // null = letzter Versuch war OK, sonst Fehlermeldung
+let lastOpeningHoursScrapeError = null;
 let lastOpeningHoursScrapeAttempt = 0;
+
+// Die Phantasialand-Entity-ID bei ThemeParks.wiki wird NICHT hartcodiert,
+// sondern einmalig über den /destinations-Endpoint aufgelöst und gecacht -
+// das macht den Code robust gegen den (unwahrscheinlichen, aber möglichen)
+// Fall, dass sich die ID mal ändert, ohne dass wir sie händisch pflegen müssen.
+let phantasialandEntityIdCache = null;
+
+async function resolvePhantasialandEntityId() {
+  if (phantasialandEntityIdCache) return phantasialandEntityIdCache;
+
+  const res = await fetchWithTimeout(`${THEMEPARKS_WIKI_BASE}/destinations`, {}, 10000);
+  if (!res.ok) throw new Error(`ThemeParks.wiki /destinations HTTP ${res.status}`);
+  const data = await res.json();
+
+  // Die Antwortstruktur ist { destinations: [ { id, name, parks: [ { id, name } ] } ] } -
+  // wir suchen den PARK (nicht die Destination selbst), da der Schedule-
+  // Endpoint eine Park- oder Attraktions-Entity-ID erwartet.
+  for (const destination of data.destinations || []) {
+    for (const park of destination.parks || []) {
+      if (park.name && park.name.toLowerCase().includes('phantasialand')) {
+        phantasialandEntityIdCache = park.id;
+        return park.id;
+      }
+    }
+    // Manche Destinationen sind selbst schon der Park (kein "parks"-Array,
+    // 1:1 Destination = Park) - zusätzlich auf Destination-Ebene prüfen
+    if (destination.name && destination.name.toLowerCase().includes('phantasialand')) {
+      phantasialandEntityIdCache = destination.id;
+      return destination.id;
+    }
+  }
+
+  throw new Error('Phantasialand nicht in ThemeParks.wiki /destinations gefunden');
+}
+
+async function scrapeOpeningHoursFromThemeParksWiki() {
+  const entityId = await resolvePhantasialandEntityId();
+
+  const res = await fetchWithTimeout(`${THEMEPARKS_WIKI_BASE}/entity/${entityId}/schedule`, {}, 10000);
+  if (!res.ok) throw new Error(`ThemeParks.wiki /schedule HTTP ${res.status}`);
+  const data = await res.json();
+
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+  const todayEntry = (data.schedule || []).find(entry => entry.date === today);
+
+  if (!todayEntry) {
+    // Kein Eintrag für heute (z.B. außerhalb der Saison gar nicht gelistet) ->
+    // als "geschlossen" werten, nicht als Fehler, da die Antwort selbst gültig war
+    return { openTime: null, closeTime: null, closed: true };
+  }
+
+  if (todayEntry.type === 'CLOSED' || !todayEntry.openingTime) {
+    return { openTime: null, closeTime: null, closed: true };
+  }
+
+  // ThemeParks.wiki liefert openingTime/closingTime als volle ISO-Zeitstempel
+  // (z.B. "2026-09-09T09:00:00+02:00") - wir extrahieren nur HH:MM in der
+  // Park-eigenen Zeitzone (die im Zeitstempel-Offset bereits enthalten ist).
+  const openTime = new Date(todayEntry.openingTime).toLocaleTimeString('de-DE', {
+    timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit'
+  });
+  const closeTime = new Date(todayEntry.closingTime).toLocaleTimeString('de-DE', {
+    timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit'
+  });
+
+  return { openTime, closeTime, closed: false };
+}
 
 async function scrapeOpeningHoursFromWartezeitenApp() {
   const res = await fetchWithTimeout(WARTEZEITEN_APP_URL, {
@@ -428,42 +491,27 @@ async function scrapeOpeningHoursFromWartezeitenApp() {
 
   const html = await res.text();
 
-  // Geschlossen-Fall zuerst prüfen (z.B. Wartungstag außerhalb der Saison)
   if (/(heute|park)\s+geschlossen/i.test(html)) {
     return { openTime: null, closeTime: null, closed: true };
   }
 
-  // WICHTIG: Die Seite rendert den Öffnungszeiten-Text serverseitig direkt im
-  // HTML (kein JS-Rendering nötig für diesen Teil - "JavaScript ist deaktiviert"
-  // betrifft nur die interaktive Tabelle, nicht den Kopftext). Trotzdem wird das
-  // Layout gelegentlich leicht geändert (z.B. Bindestrich statt "bis",
-  // geschütztes Leerzeichen &nbsp; statt normalem Leerzeichen, "Uhr" entfernt).
-  // Daher mehrere Muster probieren, vom spezifischsten zum großzügigsten:
+  const normalizedHtml = html.replace(/&nbsp;/g, ' ').replace(/\u00A0/g, ' ');
   const patterns = [
-    // Original-Muster: "Von 09:00 bis 18:00 Uhr geöffnet"
     /Von\s+(\d{1,2}):(\d{2})\s+bis\s+(\d{1,2}):(\d{2})\s+Uhr\s+geöffnet/i,
-    // Ohne "Uhr" oder ohne "geöffnet" am Ende
     /Von\s+(\d{1,2}):(\d{2})\s+bis\s+(\d{1,2}):(\d{2})/i,
-    // Mit Bindestrich/En-Dash statt "bis" (z.B. "09:00 - 18:00 Uhr")
     /(\d{1,2}):(\d{2})\s*(?:-|–|bis)\s*(\d{1,2}):(\d{2})\s*Uhr/i
   ];
 
   let match = null;
   for (const pattern of patterns) {
-    // Nicht-brechende Leerzeichen (\u00A0) und HTML-Entities (&nbsp;) vor dem
-    // Matchen normalisieren, da diese das \s in den Regexen sonst blockieren
-    const normalizedHtml = html.replace(/&nbsp;/g, ' ').replace(/\u00A0/g, ' ');
     match = normalizedHtml.match(pattern);
     if (match) break;
   }
 
   if (!match) {
-    // Diagnose-Hilfe: einen kleinen Ausschnitt rund um "geöffnet" oder "Uhr"
-    // ins Log schreiben, damit man beim nächsten Fehlschlag sofort sieht,
-    // wie der tatsächliche Text jetzt aussieht, ohne die ganze Seite dumpen zu müssen.
-    const contextMatch = html.match(/.{0,60}(geöffnet|Uhr geöffnet|Öffnungszeit).{0,60}/i);
+    const contextMatch = normalizedHtml.match(/.{0,60}(geöffnet|Uhr geöffnet|Öffnungszeit).{0,60}/i);
     const snippet = contextMatch ? contextMatch[0].replace(/\s+/g, ' ').trim() : '(kein Kontext gefunden)';
-    throw new Error(`Öffnungszeiten-Text nicht im HTML gefunden (Seitenlayout evtl. geändert). Kontext: "${snippet}"`);
+    throw new Error(`Öffnungszeiten-Text nicht im HTML gefunden. Kontext: "${snippet}"`);
   }
 
   const openTime = `${match[1].padStart(2, '0')}:${match[2]}`;
@@ -471,6 +519,28 @@ async function scrapeOpeningHoursFromWartezeitenApp() {
   return { openTime, closeTime, closed: false };
 }
 
+// Versucht die Quellen NACHEINANDER: zuerst ThemeParks.wiki (stabil, kein
+// Bot-Schutz), bei Fehler wartezeiten.app als zweite Quelle. Nur wenn BEIDE
+// fehlschlagen, wird der Fehler nach oben durchgereicht (dort greift dann der
+// bestehende dreistufige Fallback: stale-Daten oder harter Notfallwert).
+async function scrapeOpeningHours() {
+  try {
+    const result = await scrapeOpeningHoursFromThemeParksWiki();
+    console.log('✅ Öffnungszeiten erfolgreich von ThemeParks.wiki geladen.');
+    return result;
+  } catch (primaryErr) {
+    console.warn(`⚠️ ThemeParks.wiki fehlgeschlagen (${primaryErr.message}), versuche wartezeiten.app als Fallback...`);
+    try {
+      const result = await scrapeOpeningHoursFromWartezeitenApp();
+      console.log('✅ Öffnungszeiten erfolgreich von wartezeiten.app geladen (Fallback-Quelle).');
+      return result;
+    } catch (fallbackErr) {
+      // Beide Quellen fehlgeschlagen - eine kombinierte Fehlermeldung werfen,
+      // damit im Log sichtbar ist, WARUM beide nicht funktioniert haben
+      throw new Error(`ThemeParks.wiki: ${primaryErr.message} | wartezeiten.app: ${fallbackErr.message}`);
+    }
+  }
+}
 // Holt/aktualisiert die Öffnungszeiten für HEUTE mit dem oben beschriebenen
 // dreistufigen Fallback. Wird stündlich per Cron aufgerufen UND einmalig
 // beim Serverstart, damit auch nach einem Neustart sofort valide Zeiten da
@@ -480,7 +550,7 @@ async function refreshOpeningHours(parkId = '56') {
   const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
 
   try {
-    const scraped = await scrapeOpeningHoursFromWartezeitenApp();
+        const scraped = await scrapeOpeningHours();
     lastOpeningHoursScrapeError = null; // Versuch war erfolgreich
 
     if (scraped.closed) {
