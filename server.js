@@ -987,6 +987,67 @@ app.get('/api/park', async (req, res) => {
   }
 });
 
+// ---------- SCHNELLER LIVE-ENDPOINT: nur der letzte Snapshot ----------
+// Wird vom automatischen 5-Minuten-Refresh im Frontend genutzt, statt bei
+// jedem Refresh den kompletten Tagesverlauf neu zu laden (der über den Tag
+// auf mehrere tausend Zeilen anwächst). Liefert NUR den neuesten Messpunkt
+// aller Attraktionen - das Frontend hängt diesen selbst an die bereits
+// geladene Tageshistorie an (siehe loadPhantasialandData im Frontend).
+app.get('/api/park/latest', async (req, res) => {
+  const parkId = req.query.park || '56';
+
+  try {
+    if (Date.now() - lastFetchTimestamp > 7 * 60 * 1000) {
+      await fetchAndSaveData();
+    }
+
+    // Neuesten recorded_at-Zeitstempel für heute ermitteln, dann NUR die
+    // Zeilen dieses einen Zeitpunkts laden - statt wie /api/park den
+    // kompletten Tag zu joinen und zu übertragen.
+    const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
+
+    const latestTsResult = await db.execute({
+      sql: `SELECT MAX(recorded_at) as ts FROM weather_snapshots WHERE park_id = ? AND recorded_date = ?`,
+      args: [parkId, today]
+    });
+    const latestTs = latestTsResult.rows[0] && latestTsResult.rows[0].ts;
+
+    if (!latestTs) {
+      return res.json({ entry: null });
+    }
+
+    const result = await db.execute({
+      sql: `SELECT * FROM wait_times_view WHERE park_id = ? AND recorded_at = ?`,
+      args: [parkId, latestTs]
+    });
+
+    const hiddenResult = await db.execute({
+      sql: `SELECT ride_name FROM hidden_rides WHERE park_id = ?`,
+      args: [parkId]
+    });
+    const hiddenNames = new Set(hiddenResult.rows.map(r => r.ride_name));
+
+    if (result.rows.length === 0) {
+      return res.json({ entry: null });
+    }
+
+    const entry = {
+      time: result.rows[0].recorded_time,
+      timestamp: result.rows[0].recorded_at,
+      isCompleteSnapshot: !!result.rows[0].is_complete_snapshot,
+      rides: result.rows
+        .filter(row => !hiddenNames.has(row.ride_name))
+        .map(row => ({ name: row.ride_name, isOpen: !!row.is_open, waitTime: row.wait_time }))
+    };
+
+    res.json({ entry, hiddenRides: Array.from(hiddenNames) });
+
+  } catch (err) {
+    console.error('Fehler in /api/park/latest:', err.message);
+    res.status(500).json({ error: 'Serverfehler beim Abrufen der Live-Daten.' });
+  }
+});
+
 app.post('/api/hidden-rides', async (req, res) => {
   const { parkId, rideName, hidden } = req.body;
 
