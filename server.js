@@ -417,10 +417,6 @@ let lastOpeningHoursScrapeError = null; // null = letzter Versuch war OK, sonst 
 let lastOpeningHoursScrapeAttempt = 0;
 
 async function scrapeOpeningHoursFromWartezeitenApp() {
-  // Ein unauffälliger, echter Browser-User-Agent statt eines Bot-erkennbaren
-  // Strings (der vorherige "ParkPulse/1.0" wurde von wartezeiten.app mit
-  // HTTP 403 blockiert). Zusätzlich ein paar Standard-Browser-Header, damit
-  // die Anfrage nicht wie ein offensichtliches Skript aussieht.
   const res = await fetchWithTimeout(WARTEZEITEN_APP_URL, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -437,9 +433,37 @@ async function scrapeOpeningHoursFromWartezeitenApp() {
     return { openTime: null, closeTime: null, closed: true };
   }
 
-  const match = html.match(/Von\s+(\d{1,2}):(\d{2})\s+bis\s+(\d{1,2}):(\d{2})\s+Uhr\s+geöffnet/i);
+  // WICHTIG: Die Seite rendert den Öffnungszeiten-Text serverseitig direkt im
+  // HTML (kein JS-Rendering nötig für diesen Teil - "JavaScript ist deaktiviert"
+  // betrifft nur die interaktive Tabelle, nicht den Kopftext). Trotzdem wird das
+  // Layout gelegentlich leicht geändert (z.B. Bindestrich statt "bis",
+  // geschütztes Leerzeichen &nbsp; statt normalem Leerzeichen, "Uhr" entfernt).
+  // Daher mehrere Muster probieren, vom spezifischsten zum großzügigsten:
+  const patterns = [
+    // Original-Muster: "Von 09:00 bis 18:00 Uhr geöffnet"
+    /Von\s+(\d{1,2}):(\d{2})\s+bis\s+(\d{1,2}):(\d{2})\s+Uhr\s+geöffnet/i,
+    // Ohne "Uhr" oder ohne "geöffnet" am Ende
+    /Von\s+(\d{1,2}):(\d{2})\s+bis\s+(\d{1,2}):(\d{2})/i,
+    // Mit Bindestrich/En-Dash statt "bis" (z.B. "09:00 - 18:00 Uhr")
+    /(\d{1,2}):(\d{2})\s*(?:-|–|bis)\s*(\d{1,2}):(\d{2})\s*Uhr/i
+  ];
+
+  let match = null;
+  for (const pattern of patterns) {
+    // Nicht-brechende Leerzeichen (\u00A0) und HTML-Entities (&nbsp;) vor dem
+    // Matchen normalisieren, da diese das \s in den Regexen sonst blockieren
+    const normalizedHtml = html.replace(/&nbsp;/g, ' ').replace(/\u00A0/g, ' ');
+    match = normalizedHtml.match(pattern);
+    if (match) break;
+  }
+
   if (!match) {
-    throw new Error('Öffnungszeiten-Text nicht im HTML gefunden (Seitenlayout evtl. geändert)');
+    // Diagnose-Hilfe: einen kleinen Ausschnitt rund um "geöffnet" oder "Uhr"
+    // ins Log schreiben, damit man beim nächsten Fehlschlag sofort sieht,
+    // wie der tatsächliche Text jetzt aussieht, ohne die ganze Seite dumpen zu müssen.
+    const contextMatch = html.match(/.{0,60}(geöffnet|Uhr geöffnet|Öffnungszeit).{0,60}/i);
+    const snippet = contextMatch ? contextMatch[0].replace(/\s+/g, ' ').trim() : '(kein Kontext gefunden)';
+    throw new Error(`Öffnungszeiten-Text nicht im HTML gefunden (Seitenlayout evtl. geändert). Kontext: "${snippet}"`);
   }
 
   const openTime = `${match[1].padStart(2, '0')}:${match[2]}`;
