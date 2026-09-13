@@ -74,7 +74,7 @@ const PARKS = [
 ];
 
 let lastFetchTimestamp = 0;
-let savedScrollY = 0;
+
 
 const PARK_LATITUDE = 50.801472;
 const PARK_LONGITUDE = 6.876355;
