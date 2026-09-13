@@ -33,10 +33,32 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
 }
 
 // ---------- TURSO DATENBANK VERBINDUNG ----------
+// Embedded Replica statt reinem Remote-Client: eine lokale SQLite-Datei
+// (auf dem Render-Dateisystem, das bei jedem Neustart/Deploy neu ist) wird
+// im Hintergrund mit dem Turso-Primary synchron gehalten. Lesezugriffe
+// (db.execute mit SELECT) laufen dadurch lokal in Mikrosekunden statt als
+// HTTP-Roundtrip zu Turso - das ist bei den vielen sequenziellen Queries
+// pro Request der größte Hebel gegen die gefühlte Langsamkeit. Schreib-
+// zugriffe (INSERT/UPDATE) gehen weiterhin zum Remote-Primary und werden
+// danach in die lokale Replika zurückgespiegelt.
 const db = createClient({
-  url: process.env.TURSO_DATABASE_URL,
+  url: `file:${process.env.RENDER ? '/tmp' : '.'}/local-replica.db`,
+  syncUrl: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN,
+  syncInterval: 60, // Sekunden - synct automatisch im Hintergrund
 });
+
+// Einmaliger initialer Sync direkt nach dem Erstellen, damit die Replika
+// beim allerersten Request nach einem Deploy/Neustart nicht leer ist und
+// erst auf den ersten automatischen 60s-Intervall-Sync warten muss.
+async function ensureInitialSync() {
+  try {
+    await db.sync();
+    console.log('✅ Initialer Turso-Sync abgeschlossen (Embedded Replica bereit).');
+  } catch (err) {
+    console.error('⚠️ Initialer Turso-Sync fehlgeschlagen:', err.message);
+  }
+}
 
 // Ausschließlich Phantasialand - andere Parks wurden bewusst entfernt, da
 // diese App exklusiv für Phantasialand gebaut ist. Vorher liefen Kings
@@ -3031,6 +3053,7 @@ app.get('/api/smart-day-forecast', async (req, res) => {
 
 async function start() {
   try {
+    await ensureInitialSync();
     await initDatabase();
 
     // Einmalige Bereinigung: alte Wartezeiten-Daten von Kings Island (60) und
