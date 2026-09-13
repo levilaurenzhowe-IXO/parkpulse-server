@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
+const compression = require('compression');
 // Kein node-fetch mehr nötig: Node.js 18+ bringt ein natives, globales
 // fetch() mit (stabil seit Node 21), das exakt dieselbe Fetch-API wie im
 // Browser bereitstellt. Der Import entfällt komplett, der restliche Code
@@ -11,6 +12,9 @@ const { createClient } = require('@libsql/client');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use(compression()); // Gzip-Kompression aller Antworten - reduziert
+// Übertragungsgröße bei den oft mehrere hundert Zeilen langen JSON-Antworten
+// (z.B. /api/park) erheblich, besonders auf mobilen Verbindungen spürbar.
 app.use(cors());
 app.use(express.json());
 
@@ -1063,15 +1067,18 @@ app.get('/api/park', async (req, res) => {
 
     const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
 
-    const result = await db.execute({
-      sql: `SELECT * FROM wait_times_view WHERE park_id = ? AND recorded_date = ? ORDER BY recorded_at ASC`,
-      args: [parkId, today]
-    });
-
-    const hiddenResult = await db.execute({
-      sql: `SELECT ride_name FROM hidden_rides WHERE park_id = ?`,
-      args: [parkId]
-    });
+       // Beide Queries sind voneinander unabhängig - parallel statt sequenziell
+    // ausführen, spart einen kompletten Roundtrip an Wartezeit.
+    const [result, hiddenResult] = await Promise.all([
+      db.execute({
+        sql: `SELECT * FROM wait_times_view WHERE park_id = ? AND recorded_date = ? ORDER BY recorded_at ASC`,
+        args: [parkId, today]
+      }),
+      db.execute({
+        sql: `SELECT ride_name FROM hidden_rides WHERE park_id = ?`,
+        args: [parkId]
+      })
+    ]);
     const hiddenNames = new Set(hiddenResult.rows.map(r => r.ride_name));
 
     const grouped = {};
@@ -1132,15 +1139,16 @@ app.get('/api/park/latest', async (req, res) => {
       return res.json({ entry: null });
     }
 
-    const result = await db.execute({
-      sql: `SELECT * FROM wait_times_view WHERE park_id = ? AND recorded_at = ?`,
-      args: [parkId, latestTs]
-    });
-
-    const hiddenResult = await db.execute({
-      sql: `SELECT ride_name FROM hidden_rides WHERE park_id = ?`,
-      args: [parkId]
-    });
+    const [result, hiddenResult] = await Promise.all([
+      db.execute({
+        sql: `SELECT * FROM wait_times_view WHERE park_id = ? AND recorded_at = ?`,
+        args: [parkId, latestTs]
+      }),
+      db.execute({
+        sql: `SELECT ride_name FROM hidden_rides WHERE park_id = ?`,
+        args: [parkId]
+      })
+    ]);
     const hiddenNames = new Set(hiddenResult.rows.map(r => r.ride_name));
 
     if (result.rows.length === 0) {
@@ -1316,6 +1324,11 @@ app.get('/api/map-live', async (req, res) => {
       return res.json({ rides: [] });
     }
 
+    // Koordinaten müssen zuerst da sein (werden oben geprüft), aber die
+    // Wartezeiten-Abfrage selbst hängt nicht mehr von einer weiteren
+    // sequenziellen DB-Rundreise ab - keine echte Parallelisierungsmöglichkeit
+    // hier, da coordsResult.rows.length geprüft werden muss, bevor der
+    // zweite Query überhaupt Sinn ergibt. Bleibt bewusst sequenziell.
     const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Berlin' });
     const latestResult = await db.execute({
       sql: `
