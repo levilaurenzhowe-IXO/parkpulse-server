@@ -2857,7 +2857,7 @@ async function computeSmartForecast(parkId, rideName) {
 
   // Ähnliche Tage suchen (unbegrenzter Lookback - "so viele wie sie findet",
   // aber MAX_SIMILAR_DAYS als Deckel gegen Serverlast)
-  const similarDays = await findSimilarDays(parkId, rideName, todayProfile, null);
+const similarDays = await findSimilarDays(parkId, rideName, todayProfile, 60);
 
   // Fallback: keine ausreichend ähnlichen Tage gefunden -> einfacher
   // Wochentags-Ø der letzten 60 Tage als Rückfallebene, klar markiert
@@ -3069,32 +3069,48 @@ async function start() {
   try {
     await ensureInitialSync();
     await initDatabase();
+    await db.execute(`CREATE INDEX IF NOT EXISTS idx_rides_lookup ON rides (park_id, ride_name)`);
 
-    // Einmalige Bereinigung: alte Wartezeiten-Daten von Kings Island (60) und
-    // Cedar Point (64) löschen - diese Parks wurden aus der App entfernt
-    // (sie liefen vorher unnötig im 5-Minuten-Speicherzyklus mit, obwohl
-    // nirgends in der App genutzt). Betrifft nur historische Altdaten dieser
-    // beiden Fremd-Parks, Phantasialand-Daten sind davon nicht betroffen.
-    // Idempotent: löscht bei jedem Start erneut, falls doch mal wieder was
-    // reinrutschen sollte, ist aber nach dem ersten Lauf ein No-Op.
     try {
-      // park_id existiert im neuen normalisierten Schema nicht mehr direkt
-      // in wait_times (nur noch über die "rides"-Tabelle referenziert) -
-      // daher zuerst die betroffenen ride_ids ermitteln, dann darüber löschen.
-      const foreignRideIds = await db.execute(`SELECT ride_id FROM rides WHERE park_id IN ('60', '64')`);
+      // Betroffene ride_ids ermitteln
+      const foreignRideIds = await db.execute(
+        `SELECT ride_id FROM rides WHERE park_id IN (?, ?)`,
+        ['60', '64']
+      );
+
       if (foreignRideIds.rows.length > 0) {
-        const idList = foreignRideIds.rows.map(r => r.ride_id).join(',');
-        const cleanup = await db.execute(`DELETE FROM wait_times WHERE ride_id IN (${idList})`);
+        const ids = foreignRideIds.rows.map(r => r.ride_id);
+        
+        // Dynamische Platzhalter (?, ?, ...) für die IN-Klausel erzeugen
+        const placeholders = ids.map(() => '?').join(',');
+        
+        const cleanup = await db.execute(
+          `DELETE FROM wait_times WHERE ride_id IN (${placeholders})`,
+          ids
+        );
+        
         if (cleanup.rowsAffected > 0) {
           console.log(`🧹 ${cleanup.rowsAffected} alte Wartezeiten-Zeilen von entfernten Fremd-Parks gelöscht.`);
         }
-        await db.execute(`DELETE FROM rides WHERE park_id IN ('60', '64')`);
+
+        await db.execute(
+          `DELETE FROM rides WHERE park_id IN (?, ?)`,
+          ['60', '64']
+        );
       }
-      const cleanupSnapshots = await db.execute(`DELETE FROM weather_snapshots WHERE park_id IN ('60', '64')`);
+
+      const cleanupSnapshots = await db.execute(
+        `DELETE FROM weather_snapshots WHERE park_id IN (?, ?)`,
+        ['60', '64']
+      );
       if (cleanupSnapshots.rowsAffected > 0) {
         console.log(`🧹 ${cleanupSnapshots.rowsAffected} alte Wetter-Snapshots von entfernten Fremd-Parks gelöscht.`);
       }
-      const cleanupHours = await db.execute(`DELETE FROM park_opening_hours WHERE park_id IN ('60', '64')`);
+
+      const cleanupHours = await db.execute(
+        `DELETE FROM park_opening_hours WHERE park_id IN (?, ?)`,
+        ['60', '64']
+      );
       if (cleanupHours.rowsAffected > 0) {
         console.log(`🧹 ${cleanupHours.rowsAffected} alte Öffnungszeiten-Zeilen von entfernten Fremd-Parks gelöscht.`);
       }
@@ -3103,7 +3119,7 @@ async function start() {
     }
 
     await fetchAndSaveData();
-    await refreshOpeningHours(); // sofort beim Start Öffnungszeiten laden, nicht erst zur nächsten vollen Stunde warten
+    await refreshOpeningHours();
 
     app.listen(PORT, () => {
       console.log(`ParkPulse Server läuft auf Port ${PORT}`);
